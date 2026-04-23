@@ -1,6 +1,18 @@
 {
-  "name": "SiteReimaginer AI",
-  "description": "An AI-powered platform that analyzes existing websites, reimagines them with cutting-edge design and motion, and provides a ready-to-deploy HTML package.",
+  "name": "Mobile Web IDE",
+  "description": "A fully functioning mobile-first web IDE with CodeMirror editing, code completion, debugging, integrated terminal, file explorer, project management, Git + GitHub integration, Google Drive integration, real-time collaboration, customizable themes, multi-language support, and a JavaScript extensions API.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["AI Website Analysis", "Automated Redesign", "HTML Export", "Responsive Checker"]
+  "majorCapabilities": [
+    "Code editor with syntax highlighting, autocompletion, linting, search",
+    "Full Git integration (clone, commit, push, pull, branches, diff)",
+    "GitHub integration (sign in, repos, create, publish)",
+    "Google Drive integration (import, export, sync)",
+    "In-browser file system with project management",
+    "Integrated terminal with POSIX-style commands",
+    "Debugger with breakpoints and sandboxed run",
+    "Real-time collaboration over WebSockets",
+    "Extensions API and customizable themes",
+    "Refactoring tools (rename, extract, format)",
+    "Advanced code search, symbol navigation, fuzzy file open"
+  ]
 }
