@@ -27,6 +27,13 @@ import CommandPalette from './components/CommandPalette';
 import ThemePicker from './components/ThemePicker';
 import AIChatPanel from './components/AIChatPanel';
 import CodeEditor, { EditorHandle } from './components/Editor';
+import { Glyph } from './components/Glyph';
+import Heartbeat from './components/Heartbeat';
+import SaveIndicator from './components/SaveIndicator';
+import ErrorBoundary from './components/ErrorBoundary';
+import MobileKeybar from './components/MobileKeybar';
+import { useAutosave } from './hooks/useAutosave';
+import { GlyphName } from './lib/glyphs';
 import {
   ROOT,
   ensureRoot,
@@ -230,17 +237,29 @@ export default function App() {
     [active],
   );
 
+  // Shared write routing used by both explicit save and autosave.
+  const persistFile = useCallback(
+    async (path: string, text: string): Promise<void> => {
+      if (isLocalFile(path)) {
+        await localWrite(path, text); // may throw on permission/path errors
+      } else {
+        await writeText(path, text); // virtual FS — effectively never throws
+      }
+      setTabs((t) => t.map((x) => (x.path === path ? { ...x, dirty: false } : x)));
+      ext.host.emit('fileSaved', { path });
+    },
+    [isLocalFile],
+  );
+
   async function saveActive(): Promise<void> {
     if (!active) return;
     const text = editorRef.current?.getDoc() ?? docs[active] ?? '';
-    if (isLocalFile(active)) {
-      await localWrite(active, text);
-    } else {
-      await writeText(active, text);
+    try {
+      await persistFile(active, text);
+      setNotification('Saved ' + active);
+    } catch (err) {
+      setNotification('Save failed: ' + (err instanceof Error ? err.message : String(err)));
     }
-    setTabs((t) => t.map((x) => (x.path === active ? { ...x, dirty: false } : x)));
-    setNotification('Saved ' + active);
-    ext.host.emit('fileSaved', { path: active });
   }
 
   // --- theme ---
@@ -363,6 +382,56 @@ export default function App() {
 
   const activeDoc = active ? docs[active] ?? '' : '';
 
+  // Dev-only error-boundary test hook. Call `window.__crashPanel('side')`
+  // or `__crashPanel('editor')` or `__crashPanel('bottom')` in DevTools to
+  // force a render-time throw in the named scope so you can confirm the
+  // boundary contains it. Tree-shaken out of production builds.
+  const [crashedScopes, setCrashedScopes] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    (window as unknown as { __crashPanel?: (s: string) => void }).__crashPanel = (scope: string) => {
+      setCrashedScopes((prev) => new Set(prev).add(scope));
+    };
+    (window as unknown as { __healPanel?: (s: string) => void }).__healPanel = (scope: string) => {
+      setCrashedScopes((prev) => {
+        const next = new Set(prev);
+        next.delete(scope);
+        return next;
+      });
+    };
+    return () => {
+      delete (window as unknown as { __crashPanel?: unknown }).__crashPanel;
+      delete (window as unknown as { __healPanel?: unknown }).__healPanel;
+    };
+  }, []);
+  const Crasher = ({ scope }: { scope: string }): null => {
+    if (import.meta.env.DEV && crashedScopes.has(scope)) {
+      throw new Error('[__crashPanel] forced crash: ' + scope);
+    }
+    return null;
+  };
+
+  // Debounced autosave — 500ms after last keystroke. Local-FS writes
+  // may fail (permission, disk, bad path); virtual-FS writes are
+  // effectively fire-and-forget.
+  const autosave = useAutosave(active, activeDoc, persistFile, 500);
+
+  const activityItems: ReadonlyArray<{ id: Activity; glyph: GlyphName; label: string; title: string }> = [
+    { id: 'files',    glyph: 'files',    label: 'FS', title: 'Files' },
+    { id: 'search',   glyph: 'search',   label: 'SR', title: 'Search' },
+    { id: 'git',      glyph: 'git',      label: 'GT', title: 'Source control' },
+    { id: 'debug',    glyph: 'debug',    label: 'RN', title: 'Run & debug' },
+    { id: 'drive',    glyph: 'drive',    label: 'DR', title: 'Drive' },
+    { id: 'ext',      glyph: 'ext',      label: 'EX', title: 'Extensions' },
+    { id: 'projects', glyph: 'projects', label: 'PJ', title: 'Projects' },
+    { id: 'collab',   glyph: 'collab',   label: 'CO', title: 'Collaboration' },
+    { id: 'ai',       glyph: 'ai',       label: 'AI', title: 'AI Assistant' },
+  ];
+
+  const projectRel = projectDir.replace(ROOT + '/', '');
+  const crumbs = projectRel.split('/').filter(Boolean);
+  const crumbClass = (i: number) => ['crumb-a', 'crumb-b', 'crumb-c'][i % 3];
+
   return (
     <div className="ide" data-theme={theme.id}>
       {/* top bar */}
@@ -372,181 +441,126 @@ export default function App() {
           onClick={() => setSideOpen((x) => !x)}
           title="Toggle side panel"
         >
-          ☰
+          <Glyph name="menu" />
         </button>
-        <div className="topbar-title">Mobile Web IDE</div>
-        <div className="topbar-project">{projectDir.replace(ROOT + '/', '')}</div>
+        <div className="brand" title="Mobile Web IDE">
+          <span className="brand-mark"><Glyph name="bolt" /></span>
+          <span className="brand-text">
+            <span>MW</span>
+            <span className="brand-dim">IDE</span>
+          </span>
+        </div>
+        <div className="topbar-project" title={projectRel}>
+          {crumbs.length === 0 ? (
+            <span className="crumb-a">~</span>
+          ) : (
+            crumbs.map((c, i) => (
+              <span key={i}>
+                {i > 0 && <span className="crumb-sep">/</span>}
+                <span className={crumbClass(i)}>{c}</span>
+              </span>
+            ))
+          )}
+        </div>
         <div className="topbar-spacer" />
         <ThemePicker themes={themes} current={theme.id} onPick={pickTheme} />
         <button className="icon-btn" onClick={() => setPalOpen(true)} title="Command palette">
-          ⌘
+          <Glyph name="palette" />
         </button>
         <button
           className="icon-btn"
           onClick={() => setBottomOpen((x) => !x)}
-          title="Toggle bottom panel"
+          title="Toggle terminal"
         >
-          ▤
+          <Glyph name="bottom" />
         </button>
         <button className="icon-btn" onClick={saveActive} title="Save" disabled={!active}>
-          💾
+          <Glyph name="save" />
         </button>
       </header>
 
       <div className="workbench">
         {/* activity bar */}
         <nav className="activity-bar">
-          <button
-            className={activity === 'files' ? 'active' : ''}
-            onClick={() => {
-              setActivity('files');
-              setSideOpen(true);
-            }}
-            title="Files"
-          >
-            📁
-          </button>
-          <button
-            className={activity === 'search' ? 'active' : ''}
-            onClick={() => {
-              setActivity('search');
-              setSideOpen(true);
-            }}
-            title="Search"
-          >
-            🔎
-          </button>
-          <button
-            className={activity === 'git' ? 'active' : ''}
-            onClick={() => {
-              setActivity('git');
-              setSideOpen(true);
-            }}
-            title="Source control"
-          >
-            ⎇
-          </button>
-          <button
-            className={activity === 'debug' ? 'active' : ''}
-            onClick={() => {
-              setActivity('debug');
-              setSideOpen(true);
-            }}
-            title="Run & debug"
-          >
-            ▶
-          </button>
-          <button
-            className={activity === 'drive' ? 'active' : ''}
-            onClick={() => {
-              setActivity('drive');
-              setSideOpen(true);
-            }}
-            title="Google Drive"
-          >
-            ☁
-          </button>
-          <button
-            className={activity === 'ext' ? 'active' : ''}
-            onClick={() => {
-              setActivity('ext');
-              setSideOpen(true);
-            }}
-            title="Extensions"
-          >
-            🧩
-          </button>
-          <button
-            className={activity === 'projects' ? 'active' : ''}
-            onClick={() => {
-              setActivity('projects');
-              setSideOpen(true);
-            }}
-            title="Projects"
-          >
-            📚
-          </button>
-          <button
-            className={activity === 'collab' ? 'active' : ''}
-            onClick={() => {
-              setActivity('collab');
-              setSideOpen(true);
-            }}
-            title="Collaboration"
-          >
-            👥
-          </button>
-          <button
-            className={activity === 'ai' ? 'active' : ''}
-            onClick={() => {
-              setActivity('ai');
-              setSideOpen(true);
-            }}
-            title="AI Assistant"
-          >
-            🤖
-          </button>
+          {activityItems.map((it) => (
+            <button
+              key={it.id}
+              className={activity === it.id ? 'active' : ''}
+              onClick={() => {
+                setActivity(it.id);
+                setSideOpen(true);
+              }}
+              title={it.title}
+            >
+              <Glyph name={it.glyph} />
+              <span className="slot-label">{it.label}</span>
+            </button>
+          ))}
         </nav>
 
-        {/* side panel */}
+        {/* side panel — each activity wrapped in its own boundary so
+            a crash in one panel can't take down the IDE. */}
         <aside className={'side-panel ' + (sideOpen ? 'open' : 'closed')}>
-          {activity === 'files' && (
-            <FileExplorer
-              root={projectDir}
-              activePath={active}
-              onOpen={openPath}
-              onChange={() => setTree((k) => k + 1)}
-              refreshKey={tree}
-              localRoot={localRoot}
-              onLocalRootChange={setLocalRoot}
-            />
-          )}
-          {activity === 'search' && (
-            <SearchPanel projectDir={projectDir} onOpen={(p, l) => openPath(p, l)} />
-          )}
-          {activity === 'git' && (
-            <GitPanel
-              projectDir={projectDir}
-              onProjectChanged={setProjectDir}
-              onRefresh={() => setTree((k) => k + 1)}
-              author={author}
-            />
-          )}
-          {activity === 'debug' && (
-            <DebugPanel
-              activePath={active}
-              getActiveSource={() => editorRef.current?.getDoc() ?? ''}
-              breakpoints={breakpoints}
-              onToggleBreakpoint={toggleBreakpoint}
-            />
-          )}
-          {activity === 'drive' && (
-            <DrivePanel
-              projectDir={projectDir}
-              activePath={active}
-              onRefresh={() => setTree((k) => k + 1)}
-            />
-          )}
-          {activity === 'ext' && <ExtensionsPanel onRefreshCommands={refreshCommands} />}
-          {activity === 'projects' && (
-            <ProjectsPanel projectDir={projectDir} onOpen={setProjectDir} />
-          )}
-          {activity === 'collab' && (
-            <CollabPanel
-              projectDir={projectDir}
-              me={me}
-              onDocIncoming={onIncomingDoc}
-              onCursor={() => {}}
-              bindOut={(c) => (collabRef.current = c)}
-            />
-          )}
-          {activity === 'ai' && (
-            <AIChatPanel
-              projectDir={projectDir}
-              openFiles={tabs.map((t) => t.path)}
-              onFileChanged={() => setTree((k) => k + 1)}
-            />
-          )}
+          <ErrorBoundary label={'Side panel: ' + activity} resetKey={activity}>
+            <Crasher scope="side" />
+            {activity === 'files' && (
+              <FileExplorer
+                root={projectDir}
+                activePath={active}
+                onOpen={openPath}
+                onChange={() => setTree((k) => k + 1)}
+                refreshKey={tree}
+                localRoot={localRoot}
+                onLocalRootChange={setLocalRoot}
+              />
+            )}
+            {activity === 'search' && (
+              <SearchPanel projectDir={projectDir} onOpen={(p, l) => openPath(p, l)} />
+            )}
+            {activity === 'git' && (
+              <GitPanel
+                projectDir={projectDir}
+                onProjectChanged={setProjectDir}
+                onRefresh={() => setTree((k) => k + 1)}
+                author={author}
+              />
+            )}
+            {activity === 'debug' && (
+              <DebugPanel
+                activePath={active}
+                getActiveSource={() => editorRef.current?.getDoc() ?? ''}
+                breakpoints={breakpoints}
+                onToggleBreakpoint={toggleBreakpoint}
+              />
+            )}
+            {activity === 'drive' && (
+              <DrivePanel
+                projectDir={projectDir}
+                activePath={active}
+                onRefresh={() => setTree((k) => k + 1)}
+              />
+            )}
+            {activity === 'ext' && <ExtensionsPanel onRefreshCommands={refreshCommands} />}
+            {activity === 'projects' && (
+              <ProjectsPanel projectDir={projectDir} onOpen={setProjectDir} />
+            )}
+            {activity === 'collab' && (
+              <CollabPanel
+                projectDir={projectDir}
+                me={me}
+                onDocIncoming={onIncomingDoc}
+                onCursor={() => {}}
+                bindOut={(c) => (collabRef.current = c)}
+              />
+            )}
+            {activity === 'ai' && (
+              <AIChatPanel
+                projectDir={projectDir}
+                openFiles={tabs.map((t) => t.path)}
+                onFileChanged={() => setTree((k) => k + 1)}
+              />
+            )}
+          </ErrorBoundary>
         </aside>
 
         {/* editor area */}
@@ -560,7 +574,7 @@ export default function App() {
               >
                 <span className="tab-name">
                   {t.path.split('/').pop()}
-                  {t.dirty ? '●' : ''}
+                  {t.dirty && <span className="tab-dirty" aria-label="unsaved" />}
                 </span>
                 <button
                   className="tab-close"
@@ -568,53 +582,63 @@ export default function App() {
                     e.stopPropagation();
                     closeTab(t.path);
                   }}
+                  title="Close"
                 >
-                  ✕
+                  <Glyph name="close" />
                 </button>
               </div>
             ))}
             {tabs.length === 0 && (
-              <div className="tab placeholder">Select a file to begin</div>
+              <div className="tab placeholder">no file open — open one from the file tree</div>
             )}
           </div>
           <div className="editor-wrap">
             {active ? (
-              <CodeEditor
-                key={active}
-                path={active}
-                initialDoc={activeDoc}
-                theme={theme}
-                onChange={onChange}
-                onCursor={onCursor}
-                onRef={(h) => (editorRef.current = h)}
-              />
+              <ErrorBoundary label="Editor" resetKey={active}>
+                <Crasher scope="editor" />
+                <CodeEditor
+                  key={active}
+                  path={active}
+                  initialDoc={activeDoc}
+                  theme={theme}
+                  onChange={onChange}
+                  onCursor={onCursor}
+                  onRef={(h) => (editorRef.current = h)}
+                />
+              </ErrorBoundary>
             ) : (
               <div className="empty-editor">
                 <h2>Mobile Web IDE</h2>
+                <p className="tagline">// a terminal-native development surface</p>
                 <p>
                   Pick a file from the Files panel, clone a GitHub repo from Source
                   Control, or create a new project to begin.
                 </p>
                 <ul>
-                  <li>📁 Files — explore & edit</li>
-                  <li>🔎 Search — find in files, go to symbol, go to file</li>
-                  <li>⎇ Source Control — clone, commit, push, branch</li>
-                  <li>▶ Run & Debug — breakpoints, logs, step</li>
-                  <li>☁ Drive — import/export with Google Drive</li>
-                  <li>🧩 Extensions — install custom JS extensions</li>
-                  <li>📚 Projects — create, switch, manage tasks</li>
-                  <li>👥 Collaboration — realtime edit with peers</li>
+                  <li><Glyph name="files"    /><b>Files</b>       <span>explore &amp; edit</span></li>
+                  <li><Glyph name="search"   /><b>Search</b>      <span>find in files, symbols, files</span></li>
+                  <li><Glyph name="git"      /><b>Source</b>      <span>clone, commit, push, branch</span></li>
+                  <li><Glyph name="debug"    /><b>Run</b>         <span>breakpoints, logs, step</span></li>
+                  <li><Glyph name="drive"    /><b>Drive</b>       <span>import / export with Google Drive</span></li>
+                  <li><Glyph name="ext"      /><b>Extensions</b>  <span>install custom JS extensions</span></li>
+                  <li><Glyph name="projects" /><b>Projects</b>    <span>create, switch, manage tasks</span></li>
+                  <li><Glyph name="collab"   /><b>Collab</b>      <span>realtime edit with peers</span></li>
+                  <li><Glyph name="ai"       /><b>AI</b>          <span>in-line assistant for code &amp; chat</span></li>
                 </ul>
               </div>
             )}
           </div>
           <div className="status-bar">
-            <span>{active || 'no file'}</span>
-            <span className="spacer" />
-            <span>
-              Ln {cursor.line}, Col {cursor.col}
+            <span className="st-branch" title="Brand"><Glyph name="bolt" /> MWIDE</span>
+            <span className="st-path" title={active || 'no file'}>
+              <span className="st-key">FILE</span>
+              {active ? active.replace(projectDir + '/', '').replace(ROOT + '/', '~/') : '—'}
             </span>
-            <span>{theme.label}</span>
+            <span className="spacer" />
+            <span className="st-pos"><span className="st-key">POS</span>{String(cursor.line).padStart(3, ' ')}:{String(cursor.col).padStart(3, ' ')}</span>
+            <SaveIndicator state={autosave} />
+            <span className="st-theme"><span className="st-key">THEME</span>{theme.label}</span>
+            <span className="st-heart" title="Event pulse"><Heartbeat /></span>
           </div>
         </main>
       </div>
@@ -627,43 +651,46 @@ export default function App() {
               className={bottomTab === 'terminal' ? 'active' : ''}
               onClick={() => setBottomTab('terminal')}
             >
-              Terminal
+              TERMINAL
             </button>
             <button
               className={bottomTab === 'debug' ? 'active' : ''}
               onClick={() => setBottomTab('debug')}
             >
-              Debug console
+              DEBUG
             </button>
             <button
               className={bottomTab === 'problems' ? 'active' : ''}
               onClick={() => setBottomTab('problems')}
             >
-              Problems
+              PROBLEMS
             </button>
             <span className="spacer" />
-            <button onClick={() => setBottomOpen(false)}>▾</button>
+            <button onClick={() => setBottomOpen(false)} title="Collapse"><Glyph name="chevron_dn" /></button>
           </div>
           <div className="bottom-body">
-            {bottomTab === 'terminal' && (
-              <Terminal projectDir={projectDir} author={author} />
-            )}
-            {bottomTab === 'debug' && (
-              <DebugPanel
-                activePath={active}
-                getActiveSource={() => editorRef.current?.getDoc() ?? ''}
-                breakpoints={breakpoints}
-                onToggleBreakpoint={toggleBreakpoint}
-              />
-            )}
-            {bottomTab === 'problems' && (
-              <div className="problems">
-                <div className="muted">
-                  Diagnostics shown inline in the editor gutter. Open the command palette and run
-                  "Edit: Find in file" to scan for TODO/FIXME markers.
+            <ErrorBoundary label={'Bottom: ' + bottomTab} resetKey={bottomTab}>
+              <Crasher scope="bottom" />
+              {bottomTab === 'terminal' && (
+                <Terminal projectDir={projectDir} author={author} />
+              )}
+              {bottomTab === 'debug' && (
+                <DebugPanel
+                  activePath={active}
+                  getActiveSource={() => editorRef.current?.getDoc() ?? ''}
+                  breakpoints={breakpoints}
+                  onToggleBreakpoint={toggleBreakpoint}
+                />
+              )}
+              {bottomTab === 'problems' && (
+                <div className="problems">
+                  <div className="muted">
+                    Diagnostics shown inline in the editor gutter. Open the command palette and run
+                    "Edit: Find in file" to scan for TODO/FIXME markers.
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </ErrorBoundary>
           </div>
         </section>
       )}
@@ -673,6 +700,8 @@ export default function App() {
         commands={cmds}
         onClose={() => setPalOpen(false)}
       />
+
+      <MobileKeybar />
 
       {notification && (
         <div className="notification" onClick={() => setNotification(null)}>

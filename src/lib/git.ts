@@ -262,6 +262,33 @@ export async function getConfig(
   return (await git.getConfig({ fs: rawFs, dir, path })) || undefined;
 }
 
+/** Read both sides of a pending change: the committed HEAD blob for
+ *  `filepath` and the current working-tree content. Either may be
+ *  empty string (new file has no HEAD; deleted file has no workdir). */
+export async function readHeadAndWorking(
+  dir: string,
+  filepath: string,
+): Promise<{ head: string; working: string }> {
+  let head = '';
+  try {
+    const commitOid = await git.resolveRef({ fs: rawFs, dir, ref: 'HEAD' });
+    const { blob } = await git.readBlob({ fs: rawFs, dir, oid: commitOid, filepath });
+    head = new TextDecoder().decode(blob);
+  } catch {
+    head = '';
+  }
+  let working = '';
+  try {
+    working = (await rawFs.promises.readFile(
+      (dir + '/' + filepath).replace(/\/+/g, '/'),
+      'utf8',
+    )) as unknown as string;
+  } catch {
+    working = '';
+  }
+  return { head, working };
+}
+
 // Compute a basic line-level diff between the working copy and HEAD
 // for a single file. Pure JS, no external dependency.
 export type DiffLine = { kind: ' ' | '+' | '-'; text: string };

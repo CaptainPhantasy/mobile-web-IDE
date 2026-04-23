@@ -9,6 +9,7 @@ import {
   DebugSession,
   LogEntry,
 } from '../lib/debugger';
+import { Glyph } from './Glyph';
 
 type Props = {
   activePath?: string;
@@ -100,7 +101,7 @@ export default function DebugPanel({
           {breakpoints.map((bp) => (
             <div key={bp.path + bp.line} className="bp-row">
               <span>{bp.path}:{bp.line}</span>
-              <button onClick={() => onToggleBreakpoint(bp)}>✕</button>
+              <button onClick={() => onToggleBreakpoint(bp)}><Glyph name="close" /></button>
             </div>
           ))}
           {breakpoints.length === 0 && (

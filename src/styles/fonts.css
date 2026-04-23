@@ -1,0 +1,24 @@
+/* JetBrains Mono — code + chrome. Ligatures toggled per usage. */
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
+@import '@fontsource/jetbrains-mono/700.css';
+@import '@fontsource/jetbrains-mono/400-italic.css';
+
+/* Nerd Font Symbols Only — layered via unicode-range so it only kicks in
+   for Private Use Area glyphs. Everything else stays on JetBrains Mono. */
+@font-face {
+  font-family: 'SymbolsNerdFontMono';
+  src: url('/fonts/SymbolsNerdFontMono-Regular.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: block;
+  unicode-range:
+    U+E000-F8FF,
+    U+F0000-FFFFD,
+    U+100000-10FFFD,
+    U+2300-23FF,
+    U+2600-26FF,
+    U+2700-27BF,
+    U+2B00-2BFF;
+}

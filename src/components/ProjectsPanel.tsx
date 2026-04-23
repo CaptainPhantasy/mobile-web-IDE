@@ -14,6 +14,7 @@ import {
   writeText,
   exists,
 } from '../lib/fs';
+import { Glyph } from './Glyph';
 
 type Props = {
   projectDir: string;
@@ -109,7 +110,7 @@ export default function ProjectsPanel({ projectDir, onOpen }: Props) {
           return (
             <div key={p} className={'project-row ' + (dir === projectDir ? 'active' : '')}>
               <button onClick={() => onOpen(dir)}>{p}</button>
-              <button onClick={() => remove_(p)} className="icon-btn" title="Delete">✕</button>
+              <button onClick={() => remove_(p)} className="icon-btn" title="Delete"><Glyph name="trash" /></button>
             </div>
           );
         })}
@@ -144,7 +145,7 @@ export default function ProjectsPanel({ projectDir, onOpen }: Props) {
               <span>{t.title}</span>
             </label>
             <button className="icon-btn" onClick={() => removeTask(t.id)}>
-              ✕
+              <Glyph name="close" />
             </button>
           </div>
         ))}

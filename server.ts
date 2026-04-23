@@ -12,9 +12,11 @@ import express, { Request, Response, NextFunction, RequestHandler } from 'expres
 import { createServer as createViteServer } from 'vite';
 import { createServer as createHttpServer } from 'http';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs/promises';
+import * as pty from 'node-pty';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -54,7 +56,13 @@ async function startServer(): Promise<void> {
   // --- Local filesystem bridge. Provides read/write access to the
   //     host machine's real filesystem through the server.
   //     Scoped to HOME by default; rejects paths outside allowed roots.
+  app.get('/api/fs/home', (_req, res) => res.json({ home: homedir() }));
   app.get('/api/fs/list', asyncHandler(localFsList));
+
+  // --- API key vault (server-local file, 0600, HOME-based).
+  app.get('/api/vault/list',      asyncHandler(vaultListHandler));
+  app.post('/api/vault/set',      asyncHandler(vaultSetHandler));
+  app.delete('/api/vault/delete', asyncHandler(vaultDeleteHandler));
   app.get('/api/fs/read', asyncHandler(localFsRead));
   app.post('/api/fs/write', asyncHandler(localFsWrite));
   app.post('/api/fs/mkdir', asyncHandler(localFsMkdir));
@@ -79,23 +87,110 @@ async function startServer(): Promise<void> {
 
   // --- HTTP + WebSocket server.
   const httpServer = createHttpServer(app);
-  const wss = new WebSocketServer({ noServer: true });
+  const collabWss = new WebSocketServer({ noServer: true });
+  const ptyWss    = new WebSocketServer({ noServer: true });
   httpServer.on('upgrade', (req, socket, head) => {
     const u = new URL(req.url || '/', 'http://localhost');
     if (u.pathname === '/ws/collab') {
-      wss.handleUpgrade(req, socket, head, (ws) =>
-        wss.emit('connection', ws, req),
+      collabWss.handleUpgrade(req, socket, head, (ws) =>
+        collabWss.emit('connection', ws, req),
+      );
+    } else if (u.pathname === '/ws/pty') {
+      ptyWss.handleUpgrade(req, socket, head, (ws) =>
+        ptyWss.emit('connection', ws, req),
       );
     } else {
       socket.destroy();
     }
   });
-  setupCollabHub(wss);
+  setupCollabHub(collabWss);
+  setupPtyHub(ptyWss);
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
+  // Bind localhost only. The FS bridge grants real-disk read/write to
+  // anyone who can reach this port — binding to 127.0.0.1 keeps it off
+  // the LAN. Set IDE_BIND=0.0.0.0 to override on trusted networks.
+  const BIND = process.env.IDE_BIND || '127.0.0.1';
+  httpServer.listen(PORT, BIND, () => {
     console.log(`[web-ide] http://localhost:${PORT}`);
     console.log(`[web-ide] git proxy at /api/git-proxy`);
     console.log(`[web-ide] collab websocket at /ws/collab`);
+    console.log(`[web-ide] pty websocket at /ws/pty`);
+  });
+}
+
+// -------- PTY WebSocket hub --------
+// One PTY per WebSocket. Spawns the user's login shell so .zshrc, Starship,
+// FLOYD_MODE, PATH, aliases, etc. all work as if the user opened a fresh
+// iTerm2 tab. Client framing is JSON messages:
+//   client → server: {type:'open', cols, rows, cwd?} | {type:'in', data} | {type:'resize', cols, rows}
+//   server → client: {type:'out', data} | {type:'exit', code} | {type:'ready', pid, shell}
+function setupPtyHub(wss: WebSocketServer): void {
+  wss.on('connection', (ws) => {
+    let proc: pty.IPty | null = null;
+
+    const send = (obj: unknown) => {
+      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+    };
+
+    ws.on('message', async (raw) => {
+      let msg: { type: string; [k: string]: unknown };
+      try {
+        msg = JSON.parse(String(raw));
+      } catch {
+        return;
+      }
+      if (msg.type === 'open' && !proc) {
+        const shell = process.env.SHELL || '/bin/zsh';
+        const cols = Math.max(20, Number(msg.cols) || 80);
+        const rows = Math.max(4,  Number(msg.rows) || 24);
+        // Client may send a virtual-FS path from the IDE. node-pty/zsh
+        // needs a real on-disk path, otherwise the shell exits immediately.
+        // Resolve: use the requested cwd only if it exists on disk;
+        // otherwise fall back to the user's homedir.
+        let cwd = os.homedir();
+        if (typeof msg.cwd === 'string' && msg.cwd) {
+          try {
+            const stat = await fs.stat(msg.cwd);
+            if (stat.isDirectory()) cwd = msg.cwd;
+          } catch { /* bad path — keep homedir */ }
+        }
+        try {
+          proc = pty.spawn(shell, ['-l'], {
+            name: 'xterm-256color',
+            cols, rows, cwd,
+            env: {
+              ...process.env,
+              TERM: 'xterm-256color',
+              COLORTERM: 'truecolor',
+              TERM_PROGRAM: 'MWIDE',
+            } as Record<string, string>,
+          });
+        } catch (err) {
+          send({ type: 'exit', code: -1, error: err instanceof Error ? err.message : String(err) });
+          ws.close();
+          return;
+        }
+        send({ type: 'ready', pid: proc.pid, shell });
+        proc.onData((data) => send({ type: 'out', data }));
+        proc.onExit(({ exitCode }) => {
+          send({ type: 'exit', code: exitCode });
+          try { ws.close(); } catch { /* already closed */ }
+        });
+      } else if (msg.type === 'in' && proc && typeof msg.data === 'string') {
+        proc.write(msg.data);
+      } else if (msg.type === 'resize' && proc) {
+        const cols = Math.max(20, Number(msg.cols) || 80);
+        const rows = Math.max(4,  Number(msg.rows) || 24);
+        try { proc.resize(cols, rows); } catch { /* proc gone */ }
+      }
+    });
+
+    ws.on('close', () => {
+      if (proc) {
+        try { proc.kill(); } catch { /* already dead */ }
+        proc = null;
+      }
+    });
   });
 }
 
@@ -299,6 +394,10 @@ async function llmStreamProxy(req: Request, res: Response): Promise<void> {
     res.status(400).json({ error: 'Missing provider or messages' });
     return;
   }
+  // Resolve from vault first; falls back to client-provided key for
+  // the migration window. After migration, clients should not include
+  // apiKey in the request body.
+  provider.apiKey = await resolveProviderKey(provider);
   if (!provider.apiKey) {
     res.status(400).json({ error: 'API key not configured for this provider' });
     return;
@@ -609,6 +708,7 @@ async function llmTestHandler(req: Request, res: Response): Promise<void> {
     res.status(400).json({ ok: false, error: 'Missing provider config' });
     return;
   }
+  provider.apiKey = await resolveProviderKey(provider);
   if (!provider.apiKey) {
     res.json({ ok: false, error: 'API key not configured' });
     return;
@@ -691,31 +791,168 @@ async function llmTestHandler(req: Request, res: Response): Promise<void> {
   }
 }
 
+// -------- API key vault --------
+// Keys are held in ~/.config/mwide-vault.json, chmod 0600, written via
+// atomic rename. The client never stores keys — it only sees which
+// provider IDs have keys set (via /api/vault/list) and sends
+// provider.id to the proxy endpoints. The proxy reads the key from the
+// vault by that ID before calling the upstream provider.
+//
+// Threat model: protects against XSS in the page reading keys out of
+// localStorage/IndexedDB. Does NOT protect against the server process
+// itself being compromised — but the server is the trust boundary
+// (it's running on the user's machine with the user's permissions).
+
+import { homedir as _vaultHomedir } from 'os';
+const VAULT_DIR  = path.join(_vaultHomedir(), '.config');
+const VAULT_PATH = path.join(VAULT_DIR, 'mwide-vault.json');
+
+async function vaultRead(): Promise<Record<string, string>> {
+  try {
+    const txt = await fs.readFile(VAULT_PATH, 'utf-8');
+    const obj = JSON.parse(txt);
+    return (obj && typeof obj === 'object') ? obj as Record<string, string> : {};
+  } catch {
+    return {};
+  }
+}
+
+async function vaultWrite(data: Record<string, string>): Promise<void> {
+  await fs.mkdir(VAULT_DIR, { recursive: true });
+  const tmp = VAULT_PATH + '.tmp';
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  await fs.rename(tmp, VAULT_PATH);
+  try { await fs.chmod(VAULT_PATH, 0o600); } catch { /* best effort */ }
+}
+
+function validVaultId(id: unknown): id is string {
+  return typeof id === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(id);
+}
+
+async function vaultListHandler(_req: Request, res: Response): Promise<void> {
+  const data = await vaultRead();
+  // Never return the key values — only the ids with a non-empty value.
+  res.json({ ids: Object.keys(data).filter((k) => !!data[k]) });
+}
+
+async function vaultSetHandler(req: Request, res: Response): Promise<void> {
+  const { id, key } = req.body as { id: string; key: string };
+  if (!validVaultId(id) || typeof key !== 'string') {
+    res.status(400).json({ error: 'invalid id or key' });
+    return;
+  }
+  const data = await vaultRead();
+  if (key.length === 0) {
+    delete data[id];
+  } else {
+    data[id] = key;
+  }
+  await vaultWrite(data);
+  res.json({ ok: true, id });
+}
+
+async function vaultDeleteHandler(req: Request, res: Response): Promise<void> {
+  const id = String(req.query.id || '');
+  if (!validVaultId(id)) {
+    res.status(400).json({ error: 'invalid id' });
+    return;
+  }
+  const data = await vaultRead();
+  delete data[id];
+  await vaultWrite(data);
+  res.json({ ok: true, id });
+}
+
+/** Resolve an API key for a provider. Prefers the vault; falls back to
+ *  whatever the client sent in-band for backwards compat during the
+ *  migration window. Returns empty string if neither exists. */
+async function resolveProviderKey(provider: { id: string; apiKey?: string }): Promise<string> {
+  if (provider.id) {
+    const data = await vaultRead();
+    if (data[provider.id]) return data[provider.id];
+  }
+  return provider.apiKey || '';
+}
+
 // -------- Local filesystem bridge --------
-// Provides the frontend with read/write access to the host machine's real
-// filesystem. All paths are validated against ALLOWED_ROOTS (HOME + cwd).
+// Allow-list / deny-list per Legacy AI governance (.supercache contracts):
+//   - SanDisk1Tb: active development, read+write
+//   - Storage:    secondary projects, read+write
+//   - T7:         OFF LIMITS (Time Machine target) — hard deny
+//   - Google Drive: read-only cloud backbone
+//   - HOME + cwd: always allowed
+// Deny list is checked first so T7 is never reachable even if someone
+// requests it via a traversal trick.
 
 import { homedir } from 'os';
-const ALLOWED_ROOTS = [homedir(), process.cwd()];
+
+const DENY_ROOTS = [
+  '/Volumes/T7',
+  '/private/var/db',
+  '/System',
+];
+const ALLOWED_ROOTS = [
+  homedir(),
+  process.cwd(),
+  '/Volumes/SanDisk1Tb',
+  '/Volumes/Storage',
+  path.join(homedir(), 'Library/CloudStorage'), // Google Drive etc.
+  '/tmp',
+  '/opt',
+  '/usr/local',
+];
+const LIST_CAP = 5000;
 
 function assertAllowed(p: string): void {
   const resolved = path.resolve(p);
-  const ok = ALLOWED_ROOTS.some((r) => resolved.startsWith(r));
+  if (DENY_ROOTS.some((r) => resolved === r || resolved.startsWith(r + path.sep))) {
+    throw new Error(`Path denied: ${resolved}`);
+  }
+  const ok = ALLOWED_ROOTS.some(
+    (r) => resolved === r || resolved.startsWith(r + path.sep),
+  );
   if (!ok) throw new Error(`Path not allowed: ${resolved}`);
 }
 
 async function localFsList(req: Request, res: Response): Promise<void> {
   const dir = String(req.query.path || homedir());
+  // Drive picker: when path === '/Volumes', we ask the OS; but assertAllowed
+  // would reject bare '/Volumes', so short-circuit here with a synthesized
+  // listing of mounted volumes (minus the deny list).
+  if (dir === '/Volumes') {
+    try {
+      const vols = await fs.readdir('/Volumes', { withFileTypes: true });
+      const items = vols
+        .filter((e) => e.isDirectory() || e.isSymbolicLink())
+        .map((e) => {
+          const full = path.join('/Volumes', e.name);
+          const denied = DENY_ROOTS.some((r) => full === r || full.startsWith(r + path.sep));
+          return { name: e.name, path: full, type: 'dir' as const, size: 0, mtimeMs: 0, denied };
+        })
+        .filter((e) => !e.denied)
+        .sort((a, b) => a.name.localeCompare(b.name));
+      res.json({ path: dir, items, truncated: false, total: items.length });
+      return;
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
+      return;
+    }
+  }
+
   assertAllowed(dir);
   const entries = await fs.readdir(dir, { withFileTypes: true });
+  // No longer hides dotfiles — dev IDE needs to see .env, .gitignore, .github.
+  // `showHidden=false` query param opts out (to uphide system cruft).
+  const showHidden = req.query.showHidden !== 'false';
+  const filtered = showHidden ? entries : entries.filter((e) => !e.name.startsWith('.'));
+  const total = filtered.length;
   const items = await Promise.all(
-    entries
-      .filter((e) => !e.name.startsWith('.'))
+    filtered
       .sort((a, b) => {
         if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
         return a.name.localeCompare(b.name);
       })
-      .slice(0, 500)
+      .slice(0, LIST_CAP)
       .map(async (e) => {
         const full = path.join(dir, e.name);
         try {
@@ -732,7 +969,12 @@ async function localFsList(req: Request, res: Response): Promise<void> {
         }
       }),
   );
-  res.json({ path: dir, items });
+  res.json({
+    path: dir,
+    items,
+    total,
+    truncated: total > LIST_CAP,
+  });
 }
 
 async function localFsRead(req: Request, res: Response): Promise<void> {

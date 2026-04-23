@@ -5,6 +5,8 @@ import { useEffect, useState } from 'react';
 import * as git from '../lib/git';
 import * as gh from '../lib/github';
 import { ROOT, join, basename } from '../lib/fs';
+import DiffView from './DiffView';
+import { Glyph } from './Glyph';
 
 type Props = {
   projectDir: string;
@@ -35,6 +37,7 @@ export default function GitPanel({
   const [ghUser, setGhUser] = useState<gh.GithubUser | undefined>();
   const [token, setToken] = useState('');
   const [repos, setRepos] = useState<gh.GithubRepo[]>([]);
+  const [diffPath, setDiffPath] = useState<string | null>(null);
 
   async function refresh() {
     try {
@@ -243,14 +246,31 @@ export default function GitPanel({
       <div className="git-section">
         <div className="git-section-title">Changes ({status.length})</div>
         <div className="status-list">
-          {status.map((s) => (
-            <div key={s.path} className="status-row">
-              <span className={'status-label status-' + s.label}>{s.label}</span>
-              <span className="status-path">{s.path}</span>
-            </div>
-          ))}
+          {status.map((s) => {
+            const canDiff = s.label === 'modified' || s.label === 'new' || s.label === 'deleted';
+            return (
+              <button
+                key={s.path}
+                className={'status-row status-row-btn' + (diffPath === s.path ? ' active' : '')}
+                onClick={() => canDiff && setDiffPath(diffPath === s.path ? null : s.path)}
+                title={canDiff ? 'View diff' : ''}
+                aria-expanded={diffPath === s.path}
+              >
+                <span className={'status-label status-' + s.label}>{s.label}</span>
+                <span className="status-path">{s.path}</span>
+                {canDiff && (
+                  <span className="status-diff-hint" aria-hidden>
+                    <Glyph name={diffPath === s.path ? 'chevron_dn' : 'chevron_rt'} />
+                  </span>
+                )}
+              </button>
+            );
+          })}
           {status.length === 0 && <div className="muted">Working tree clean.</div>}
         </div>
+        {diffPath && (
+          <DiffView projectDir={projectDir} path={diffPath} onClose={() => setDiffPath(null)} />
+        )}
         <div className="row">
           <input
             placeholder="Commit message"

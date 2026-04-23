@@ -13,13 +13,34 @@ export type LocalFsNode = {
 export type LocalFsListResult = {
   path: string;
   items: LocalFsNode[];
+  total?: number;
+  truncated?: boolean;
 };
+
+/** Quick-pick destinations for the drive picker. Paths that don't exist
+ *  are filtered out by the caller. */
+export const QUICK_LOCATIONS: Array<{ label: string; path: string }> = [
+  { label: 'Home',       path: '~' },
+  { label: 'Volumes',    path: '/Volumes' },
+  { label: 'SanDisk1Tb', path: '/Volumes/SanDisk1Tb' },
+  { label: 'Storage',    path: '/Volumes/Storage' },
+  { label: 'Documents',  path: '~/Documents' },
+  { label: 'Desktop',    path: '~/Desktop' },
+  { label: 'Downloads',  path: '~/Downloads' },
+];
+
+/** Extract a readable error message from an API failure. */
+function formatErr(text: string): string {
+  // Express default error page is HTML; pull the <pre> message out.
+  const m = text.match(/Error:\s*([^<\n]+)/);
+  return m ? m[1].trim() : text.slice(0, 200);
+}
 
 export async function localList(dirPath: string): Promise<LocalFsListResult> {
   const r = await fetch(`/api/fs/list?path=${encodeURIComponent(dirPath)}`);
   if (!r.ok) {
     const t = await r.text();
-    throw new Error(`List failed: ${t}`);
+    throw new Error(formatErr(t));
   }
   return r.json();
 }

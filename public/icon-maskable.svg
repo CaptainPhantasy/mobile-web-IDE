@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <!-- Full-bleed bg for maskable safe zone -->
+  <rect width="512" height="512" fill="#0a0d11"/>
+  <!-- Mark sits inside 80% safe zone (centered at 256, 256 ± 205) -->
+  <path d="M 240 150 L 184 278 L 244 278 L 216 362 L 320 232 L 260 232 L 288 150 Z"
+        fill="#FF5EBE" stroke="#A8255A" stroke-width="3" stroke-linejoin="round"/>
+</svg>

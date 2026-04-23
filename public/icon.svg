@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="96" fill="#0a0d11"/>
+  <rect x="12" y="12" width="488" height="488" rx="84" fill="none" stroke="#1c2430" stroke-width="2"/>
+  <path d="M 228 96 L 148 280 L 230 280 L 190 416 L 330 232 L 248 232 L 288 96 Z"
+        fill="#FF5EBE" stroke="#A8255A" stroke-width="4" stroke-linejoin="round"/>
+  <text x="256" y="460" font-family="ui-monospace, 'JetBrains Mono', monospace" font-size="64"
+        font-weight="700" fill="#FF5EBE" text-anchor="middle" letter-spacing="6">MWIDE</text>
+</svg>

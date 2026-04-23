@@ -1,0 +1,89 @@
+/* Super Floyd × Tokyo Night × iTerm2 Ansi. 7-color semantic chromatic system.
+   Every variable here has a single reason to exist. If you're tempted to add
+   bg-4 or accent-alt, rewrite an existing role instead. */
+
+:root {
+  /* ---- surfaces (dark, low-chroma) ---- */
+  --bg-0: #0a0d11;    /* deepest: editor canvas */
+  --bg-1: #0f141a;    /* app background */
+  --bg-2: #141a22;    /* chrome: topbar, status bar, side panels */
+  --bg-3: #1c2430;    /* raised: buttons, chips, active tab base */
+  --bg-4: #252f3d;    /* hover lift */
+
+  --border:    #222b36;  /* 1px schematic line */
+  --border-hi: rgba(255,255,255,0.045); /* inset highlight on top edge */
+  --border-lo: rgba(0,0,0,0.45);        /* inset shadow on bottom edge */
+
+  /* ---- type ---- */
+  --fg:    #e6edf3;
+  --fg-2:  #B4BDC8;   /* was #9198a1 — lifted to clear AA on bg-0..bg-3 */
+  --fg-3:  #95A0AF;   /* was #6e7681 (failed AA at 4.03) — now 7.35 on bg-0 */
+
+  /* ---- 7-color semantic chromatic palette — synthwave neon tuning ----
+     Every value clears WCAG AA (≥ 4.5:1) on all dark surfaces bg-0..bg-3.
+     Source spirit: zshrc Super Floyd + iTerm2 Ansi, but lifted to readable
+     neon instead of the darker terminal originals. */
+  --c-magenta: #FF5EBE;   /* keyword, active, brand text           (7.04 on bg-0) */
+  --c-yellow:  #FCE49B;   /* warning, cursor-normal, numeric       (15.49)       */
+  --c-green:   #69FF8E;   /* success, git-new, live state          (15.11)       */
+  --c-red:     #FF8A8A;   /* error, deletion, danger               (8.58)        */
+  --c-cyan:    #5FFDFF;   /* path, link, autosuggestion            (15.74)       */
+  --c-blue:    #89DDFF;   /* info, symbol, accent-cool             (12.84)       */
+  --c-violet:  #F48FFF;   /* string, type, staged                  (9.48)        */
+
+  /* SF Magenta (Super Floyd cursor color, per ~/.zshrc). Kept for the
+     xterm cursor + activity-bar active glow where it's decorative, not
+     text. Never used for body text — it fails AA at 2.85:1. */
+  --c-brand:   #A8255A;
+
+  /* legacy aliases used across components — remap to the new system
+     so we don't have to touch every file. */
+  --accent:  var(--c-cyan);
+  --danger:  var(--c-red);
+  --ok:      var(--c-green);
+  --warn:    var(--c-yellow);
+  --brand:   var(--c-magenta);
+  --fg-accent: var(--c-cyan);
+
+  /* Alpha helpers — pre-mixed background tints that pass AA for the
+     text color sitting on top. Useful for active-row tints, toast bgs. */
+  --tint-magenta: rgba(255, 94, 190, 0.14);
+  --tint-cyan:    rgba(95, 253, 255, 0.12);
+  --tint-green:   rgba(105, 255, 142, 0.12);
+  --tint-red:     rgba(255, 138, 138, 0.12);
+  --tint-yellow:  rgba(252, 228, 155, 0.10);
+  --tint-blue:    rgba(137, 221, 255, 0.12);
+  --tint-violet:  rgba(244, 143, 255, 0.12);
+
+  --bg:   var(--bg-1);
+
+  /* ---- type scale ---- */
+  --mono:
+    'JetBrains Mono', 'JetBrainsMono Nerd Font', Monaco, 'Menlo',
+    ui-monospace, SFMono-Regular, Consolas, monospace;
+  --mono-glyph:
+    'SymbolsNerdFontMono', 'JetBrains Mono', Monaco, monospace;
+  /* `--sans` intentionally aliased to mono. This IDE has no sans serif. */
+  --sans: var(--mono);
+
+  /* ---- geometry ---- */
+  --radius: 4px;
+  --radius-sm: 2px;
+  --radius-lg: 8px;
+  --tap: 36px;
+
+  /* ---- motion ---- */
+  --dur-fast: 120ms;
+  --dur-mid:  200ms;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Ligatures: on for code, off for chrome. Chrome set in index.css. */
+.cm-editor,
+.xterm-viewport,
+.xterm-screen,
+pre,
+code {
+  font-variant-ligatures: contextual;
+  font-feature-settings: 'calt' 1, 'liga' 1;
+}
