@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { GoogleGenAI } from "@google/genai";
 import JSZip from "jszip";
+import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip, CartesianGrid } from "recharts";
 
 // Initialization of Gemini (Item 2)
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -58,6 +59,10 @@ interface RedesignData {
   typography: { primary: string; secondary: string };
   colors: { primary: string; accent: string; bg: string };
   animations: string[];
+  seo: { titleStatus: string; readability: string; mobileScore: string };
+  metrics: { designScore: string; contentClarity: string; loadSpeed: string; searchIndex: string };
+  suggestions: string[];
+  chartData: Array<{ section: string; weight: number; target: number }>;
 }
 
 export default function App() {
@@ -161,15 +166,19 @@ export default function App() {
       ? "Choose the best aesthetic automatically." 
       : `Strictly follow this design template style guidelines: ${DESIGN_TEMPLATES.find(t => t.id === selectedTemplate)?.name} - ${DESIGN_TEMPLATES.find(t => t.id === selectedTemplate)?.desc}`;
 
-    const prompt = `Analyze this website data and reimagine it as a cutting-edge, incredibly aesthetically pleasing modern website. Use high-level typography and professional copy. 
+    const prompt = `Analyze this website data and reimagine it as a cutting-edge, incredibly aesthetically pleasing modern website. Use high-level typography and professional copy. Calculate layout metrics based on the analysis!
     ${templateChoice}
     Data: ${JSON.stringify(data.pages[0])}
-    Return JSON format only: {
+    Return strict JSON format only, with no markdown codeblocks: {
       "hero": { "title": "Catchy title", "subtitle": "Compelling value prop", "cta": "Action" },
       "sections": [{ "type": "features", "title": "Prop title", "content": "Details" }],
       "typography": { "primary": "Inter", "secondary": "Playfair Display" },
       "colors": { "primary": "#000000", "accent": "#FF6321", "bg": "#FFFFFF" },
-      "animations": ["fade-up", "stagger-children", "parallax"]
+      "animations": ["fade-up", "stagger-children", "parallax"],
+      "seo": { "titleStatus": "E.g., Perfect (40 chars)", "readability": "E.g., 8th Grade", "mobileScore": "E.g., 96/100" },
+      "metrics": { "designScore": "E.g., 98/100", "contentClarity": "E.g., A+", "loadSpeed": "E.g., 0.6s", "searchIndex": "E.g., High" },
+      "suggestions": ["suggestion 1", "suggestion 2", "suggestion 3"],
+      "chartData": [{"section": "Hero", "weight": 80, "target": 90}, {"section": "Features", "weight": 60, "target": 80}]
     }`;
 
     try {
@@ -378,15 +387,15 @@ export default function App() {
                   <div className="space-y-4">
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-gray-400">Meta Title</span>
-                      <span className="text-green-500 font-mono">OK</span>
+                      <span className="text-green-500 font-mono">{redesign.seo?.titleStatus || "OK"}</span>
                     </div>
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-gray-400">Readability</span>
-                      <span className="text-amber-500 font-mono">Good</span>
+                      <span className="text-amber-500 font-mono">{redesign.seo?.readability || "Good"}</span>
                     </div>
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-gray-400">Mobile Score</span>
-                      <span className="text-green-500 font-mono">98/100</span>
+                      <span className="text-green-500 font-mono">{redesign.seo?.mobileScore || "98/100"}</span>
                     </div>
                   </div>
                 </section>
@@ -466,7 +475,7 @@ export default function App() {
                                  onChange={(e) => setRedesign({...redesign, hero: {...redesign.hero, subtitle: e.target.value}})}
                                />
                             </div>
-                            <button className="w-full py-4 bg-black text-white rounded-xl font-bold">Save Changes</button>
+                            <button onClick={() => setShowCMS(false)} className="w-full py-4 bg-black text-white rounded-xl font-bold">Save Changes</button>
                          </div>
                       </motion.div>
                     )}
@@ -476,7 +485,7 @@ export default function App() {
             </div>
           )}
 
-          {step === "dashboard" && (
+          {step === "dashboard" && redesign && (
             <motion.div 
               key="dashboard"
               initial={{ opacity: 0 }}
@@ -486,17 +495,17 @@ export default function App() {
               <div className="flex justify-between items-end">
                 <div>
                   <h1 className="text-4xl font-bold flex items-center gap-3"><BarChart2 className="w-8 h-8 text-orange-500" /> Admin Dashboard</h1>
-                  <p className="text-gray-400 mt-2">Performance metics for {url}</p>
+                  <p className="text-gray-400 mt-2">Performance & Output metics for {url}</p>
                 </div>
                 <button onClick={() => setStep("preview")} className="px-6 py-2 border border-white/10 rounded-full hover:bg-white/5">Back to Preview</button>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
                 {[
-                  { label: "Design Score", val: "94/100", trend: "+12%", Icon: Layout },
-                  { label: "Content Clarity", val: "A+", trend: "Pristine", Icon: Type },
-                  { label: "Load Speed", val: "0.8s", trend: "-0.4s", Icon: Zap },
-                  { label: "Search Index", val: "High", trend: "Optimized", Icon: Search },
+                  { label: "Design Score", val: redesign.metrics?.designScore || "94/100", Icon: Layout },
+                  { label: "Content Clarity", val: redesign.metrics?.contentClarity || "A+", Icon: Type },
+                  { label: "Load Speed", val: redesign.metrics?.loadSpeed || "0.8s", Icon: Zap },
+                  { label: "Search Index", val: redesign.metrics?.searchIndex || "High", Icon: Search },
                 ].map((stat, i) => (
                   <div key={i} className="bg-[#151518] p-6 rounded-2xl border border-white/5 space-y-4 shadow-sm shadow-orange-950/10">
                     <div className="w-10 h-10 bg-white/5 rounded-xl flex items-center justify-center text-orange-500">
@@ -506,23 +515,28 @@ export default function App() {
                       <p className="text-xs font-bold uppercase tracking-widest text-gray-500">{stat.label}</p>
                       <h4 className="text-2xl font-bold mt-1">{stat.val}</h4>
                     </div>
-                    <div className="text-xs text-green-500 font-bold">{stat.trend}</div>
                   </div>
                 ))}
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <div className="lg:col-span-2 bg-[#151518] p-8 rounded-3xl border border-white/5 h-96 flex items-center justify-center">
-                   <p className="text-gray-600 font-mono">Engagement Analytics Chart [D3 Hook Mock]</p>
+                <div className="lg:col-span-2 bg-[#151518] p-8 rounded-3xl border border-white/5 h-96 flex flex-col">
+                   <h4 className="text-lg font-bold mb-6">Component Weight Analysis</h4>
+                   <ResponsiveContainer width="100%" height="100%">
+                     <BarChart data={redesign.chartData || []}>
+                       <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" vertical={false} />
+                       <XAxis dataKey="section" stroke="#a3a3a3" fontSize={12} tickLine={false} axisLine={false} />
+                       <YAxis stroke="#a3a3a3" fontSize={12} tickLine={false} axisLine={false} />
+                       <RechartsTooltip cursor={{ fill: '#ffffff05' }} contentStyle={{ backgroundColor: '#151518', border: '1px solid #ffffff10', borderRadius: '12px' }} />
+                       <Bar dataKey="weight" fill="#f97316" radius={[4, 4, 0, 0]} name="Actual Weight" />
+                       <Bar dataKey="target" fill="#fbbf24" radius={[4, 4, 0, 0]} name="Target Profile" />
+                     </BarChart>
+                   </ResponsiveContainer>
                 </div>
                 <div className="bg-[#151518] p-8 rounded-3xl border border-white/5 space-y-6">
-                   <h4 className="text-lg font-bold">Suggested Iterations</h4>
-                   <div className="space-y-4">
-                     {[
-                       "Increase contrast on CTA buttons",
-                       "Shorten copy in the features section",
-                       "Add micro-interactions to nav links"
-                     ].map((item, i) => (
+                   <h4 className="text-lg font-bold">Recommendations</h4>
+                   <div className="space-y-4 max-h-72 overflow-y-auto pr-2 custom-scrollbar">
+                     {(redesign.suggestions || ["Expand content strategy further"]).map((item, i) => (
                        <div key={i} className="flex gap-4 items-start bg-black/20 p-4 rounded-2xl border border-white/5">
                           <div className="w-2 h-2 rounded-full bg-amber-500 mt-2 shrink-0"></div>
                           <p className="text-sm text-gray-400">{item}</p>
