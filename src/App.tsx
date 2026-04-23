@@ -25,6 +25,7 @@ import DrivePanel from './components/DrivePanel';
 import CollabPanel from './components/CollabPanel';
 import CommandPalette from './components/CommandPalette';
 import ThemePicker from './components/ThemePicker';
+import AIChatPanel from './components/AIChatPanel';
 import CodeEditor, { EditorHandle } from './components/Editor';
 import {
   ROOT,
@@ -35,6 +36,7 @@ import {
   seedFromRecord,
   writeText,
 } from './lib/fs';
+import { localRead, localWrite } from './lib/localfs';
 import { kvGet, kvSet } from './lib/kv';
 import { BUILTIN_THEMES, Theme, applyTheme } from './lib/themes';
 import * as ext from './lib/extensions';
@@ -56,7 +58,8 @@ type Activity =
   | 'drive'
   | 'ext'
   | 'projects'
-  | 'collab';
+  | 'collab'
+  | 'ai';
 
 type Tab = { path: string; dirty: boolean };
 
@@ -94,6 +97,7 @@ export default function App() {
   const [cmds, setCmds] = useState<ext.IdeCommand[]>([]);
   const [breakpoints, setBreakpoints] = useState<Breakpoint[]>([]);
   const [notification, setNotification] = useState<string | null>(null);
+  const [localRoot, setLocalRoot] = useState<string | null>(null);
   const [docs, setDocs] = useState<Record<string, string>>({});
   const editorRef = useRef<EditorHandle | null>(null);
   const collabRef = useRef<Collab | null>(null);
@@ -152,10 +156,20 @@ export default function App() {
   }, [active]);
 
   // --- tabs / open ---
+  const isLocalFile = useCallback(
+    (p: string) => !!localRoot && p.startsWith(localRoot),
+    [localRoot],
+  );
+
   const openPath = useCallback(
     async (path: string, line?: number) => {
-      if (!(await exists(path))) return;
-      const text = await readText(path);
+      let text: string;
+      if (isLocalFile(path)) {
+        text = await localRead(path);
+      } else {
+        if (!(await exists(path))) return;
+        text = await readText(path);
+      }
       setDocs((d) => ({ ...d, [path]: text }));
       setTabs((t) => (t.find((x) => x.path === path) ? t : [...t, { path, dirty: false }]));
       setActive(path);
@@ -173,7 +187,7 @@ export default function App() {
       }
       ext.host.emit('fileOpened', { path });
     },
-    [],
+    [isLocalFile],
   );
 
   const closeTab = useCallback(
@@ -219,7 +233,11 @@ export default function App() {
   async function saveActive(): Promise<void> {
     if (!active) return;
     const text = editorRef.current?.getDoc() ?? docs[active] ?? '';
-    await writeText(active, text);
+    if (isLocalFile(active)) {
+      await localWrite(active, text);
+    } else {
+      await writeText(active, text);
+    }
     setTabs((t) => t.map((x) => (x.path === active ? { ...x, dirty: false } : x)));
     setNotification('Saved ' + active);
     ext.host.emit('fileSaved', { path: active });
@@ -458,6 +476,16 @@ export default function App() {
           >
             👥
           </button>
+          <button
+            className={activity === 'ai' ? 'active' : ''}
+            onClick={() => {
+              setActivity('ai');
+              setSideOpen(true);
+            }}
+            title="AI Assistant"
+          >
+            🤖
+          </button>
         </nav>
 
         {/* side panel */}
@@ -469,6 +497,8 @@ export default function App() {
               onOpen={openPath}
               onChange={() => setTree((k) => k + 1)}
               refreshKey={tree}
+              localRoot={localRoot}
+              onLocalRootChange={setLocalRoot}
             />
           )}
           {activity === 'search' && (
@@ -508,6 +538,13 @@ export default function App() {
               onDocIncoming={onIncomingDoc}
               onCursor={() => {}}
               bindOut={(c) => (collabRef.current = c)}
+            />
+          )}
+          {activity === 'ai' && (
+            <AIChatPanel
+              projectDir={projectDir}
+              openFiles={tabs.map((t) => t.path)}
+              onFileChanged={() => setTree((k) => k + 1)}
             />
           )}
         </aside>

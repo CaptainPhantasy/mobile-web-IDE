@@ -8,19 +8,20 @@
 //   - Provide a WebSocket hub at /ws/collab for real-time
 //     collaboration between peers sharing a room.
 
-import express, { Request, Response, NextFunction } from 'express';
+import express, { Request, Response, NextFunction, RequestHandler } from 'express';
 import { createServer as createViteServer } from 'vite';
 import { createServer as createHttpServer } from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
+import fs from 'fs/promises';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function startServer(): Promise<void> {
   const app = express();
-  const PORT = Number(process.env.PORT || 3000);
+  const PORT = Number(process.env.PORT || 10001);
 
   app.use(express.json({ limit: '50mb' }));
 
@@ -40,6 +41,26 @@ async function startServer(): Promise<void> {
 
   // --- GitHub API proxy (optional, same origin).
   app.use('/api/github-proxy', githubProxy);
+
+  // --- LLM streaming proxy. Accepts provider config + messages,
+  //     forwards to the provider, and normalizes SSE events back.
+  //     Wrapped with asyncHandler() because Express 4 silently
+  //     swallows rejected promises from async route handlers.
+  app.post('/api/llm/stream', asyncHandler(llmStreamProxy));
+
+  // --- LLM connection test. Returns JSON { ok, error?, model?, responseTime? }.
+  app.post('/api/llm/test', asyncHandler(llmTestHandler));
+
+  // --- Local filesystem bridge. Provides read/write access to the
+  //     host machine's real filesystem through the server.
+  //     Scoped to HOME by default; rejects paths outside allowed roots.
+  app.get('/api/fs/list', asyncHandler(localFsList));
+  app.get('/api/fs/read', asyncHandler(localFsRead));
+  app.post('/api/fs/write', asyncHandler(localFsWrite));
+  app.post('/api/fs/mkdir', asyncHandler(localFsMkdir));
+  app.post('/api/fs/rename', asyncHandler(localFsRename));
+  app.delete('/api/fs/remove', asyncHandler(localFsRemove));
+  app.get('/api/fs/stat', asyncHandler(localFsStat));
 
   // --- Vite in dev / static in prod.
   if (process.env.NODE_ENV !== 'production') {
@@ -226,6 +247,551 @@ function broadcast(room: { members: Map<WebSocket, any> }, msg: any): void {
   for (const peer of room.members.keys()) {
     if (peer.readyState === WebSocket.OPEN) peer.send(text);
   }
+}
+
+// -------- async route wrapper for Express 4 --------
+// Express 4 does NOT catch rejected promises from async handlers.
+// Without this, any throw inside an async route silently hangs the response,
+// causing the browser to show "Failed to fetch".
+function asyncHandler(fn: RequestHandler): RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+// -------- LLM types --------
+
+type LlmProvider = {
+  id: string;
+  name: string;
+  type: 'openai' | 'anthropic' | 'custom';
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  maxTokens?: number;
+};
+
+type LlmMessage = {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: 'function';
+    function: { name: string; arguments: string };
+  }>;
+};
+
+type LlmTool = {
+  type: 'function';
+  function: { name: string; description: string; parameters: Record<string, unknown> };
+};
+
+async function llmStreamProxy(req: Request, res: Response): Promise<void> {
+  const { provider, messages, tools, debug } = req.body as {
+    provider: LlmProvider;
+    messages: LlmMessage[];
+    tools: LlmTool[];
+    debug?: boolean;
+  };
+
+  if (!provider || !messages) {
+    res.status(400).json({ error: 'Missing provider or messages' });
+    return;
+  }
+  if (!provider.apiKey) {
+    res.status(400).json({ error: 'API key not configured for this provider' });
+    return;
+  }
+
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (event: Record<string, unknown>): void => {
+    try {
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+      if (typeof (res as any).flush === 'function') (res as any).flush();
+    } catch (writeErr: any) {
+      console.error('[llm] SSE write error:', writeErr?.message);
+    }
+  };
+
+  const t0 = Date.now();
+  console.log(`[llm] stream start provider=${provider.id} model=${provider.model} url=${provider.baseUrl} debug=${!!debug}`);
+
+  try {
+    if (provider.type === 'anthropic') {
+      await streamAnthropic(provider, messages, tools, send, !!debug);
+    } else {
+      await streamOpenAICompatible(provider, messages, tools, send, !!debug);
+    }
+    console.log(`[llm] stream done in ${Date.now() - t0}ms`);
+  } catch (err: any) {
+    const msg = err?.message || String(err);
+    const stack = err?.stack || '';
+    console.error(`[llm] stream error: ${msg}`);
+    if (debug) console.error(`[llm] stack: ${stack}`);
+    send({ type: 'error', error: msg, ...(debug ? { stack, provider: provider.id, model: provider.model, baseUrl: provider.baseUrl } : {}) });
+  } finally {
+    try { res.write('data: [DONE]\n\n'); } catch {}
+    res.end();
+  }
+}
+
+async function streamOpenAICompatible(
+  provider: LlmProvider,
+  messages: LlmMessage[],
+  tools: LlmTool[],
+  send: (e: Record<string, unknown>) => void,
+  debug: boolean,
+): Promise<void> {
+  const url = `${provider.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  if (debug) console.log(`[llm] openai req URL: ${url}`);
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    messages,
+    stream: true,
+    max_tokens: provider.maxTokens || 4096,
+  };
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${provider.apiKey}`,
+  };
+  // Some providers use different header conventions
+  if (provider.id === 'openrouter') {
+    headers['HTTP-Referer'] = 'https://mobile-web-ide.local';
+    headers['X-Title'] = 'Mobile Web IDE';
+  }
+
+  const reqBody = JSON.stringify(body);
+  if (debug) console.log(`[llm] openai req body length: ${reqBody.length} chars`);
+
+  let upstream: globalThis.Response;
+  try {
+    upstream = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: reqBody,
+    });
+  } catch (fetchErr: any) {
+    const msg = fetchErr?.message || String(fetchErr);
+    console.error(`[llm] fetch failed to ${url}: ${msg}`);
+    throw new Error(`Network error reaching ${url}: ${msg}`);
+  }
+
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    console.error(`[llm] provider returned ${upstream.status}: ${text.slice(0, 300)}`);
+    throw new Error(`Provider returned HTTP ${upstream.status}: ${text.slice(0, 500)}`);
+  }
+
+  const reader = upstream.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') return;
+
+      let chunk: any;
+      try { chunk = JSON.parse(data); } catch { continue; }
+
+      const choice = chunk.choices?.[0];
+      if (!choice) continue;
+
+      // Text content
+      const content = choice.delta?.content;
+      if (content) {
+        send({ type: 'token', text: content });
+      }
+
+      // Tool calls
+      const tcDeltas = choice.delta?.tool_calls;
+      if (tcDeltas && Array.isArray(tcDeltas)) {
+        for (const tc of tcDeltas) {
+          send({
+            type: 'tool_call',
+            tool_call: {
+              id: tc.id || '',
+              type: 'function',
+              function: {
+                name: tc.function?.name || '',
+                arguments: tc.function?.arguments || '',
+              },
+            },
+          });
+        }
+      }
+
+      // Finish reason
+      if (choice.finish_reason === 'stop' || choice.finish_reason === 'end_turn') {
+        return;
+      }
+    }
+  }
+}
+
+async function streamAnthropic(
+  provider: LlmProvider,
+  messages: LlmMessage[],
+  tools: LlmTool[],
+  send: (e: Record<string, unknown>) => void,
+  debug: boolean,
+): Promise<void> {
+  const url = `${provider.baseUrl.replace(/\/+$/, '')}/messages`;
+  if (debug) console.log(`[llm] anthropic req URL: ${url}`);
+
+  // Convert OpenAI-style messages to Anthropic format
+  const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+  const nonSystem = messages.filter((m) => m.role !== 'system');
+
+  const anthropicMessages: any[] = [];
+  for (const msg of nonSystem) {
+    if (msg.role === 'tool') {
+      // Tool result — Anthropic wraps it as a user message with tool_result content blocks
+      anthropicMessages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: msg.tool_call_id || '',
+          content: msg.content,
+        }],
+      });
+    } else if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+      // Assistant with tool calls — Anthropic uses content blocks
+      const content: any[] = [];
+      if (msg.content) content.push({ type: 'text', text: msg.content });
+      for (const tc of msg.tool_calls) {
+        let input: any = {};
+        try { input = JSON.parse(tc.function.arguments); } catch {}
+        content.push({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.function.name,
+          input,
+        });
+      }
+      anthropicMessages.push({ role: 'assistant', content });
+    } else {
+      anthropicMessages.push({ role: msg.role, content: msg.content });
+    }
+  }
+
+  // Convert tools to Anthropic format
+  const anthropicTools = (tools || []).map((t) => ({
+    name: t.function.name,
+    description: t.function.description,
+    input_schema: t.function.parameters as any,
+  }));
+
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    max_tokens: provider.maxTokens || 4096,
+    messages: anthropicMessages,
+    stream: true,
+  };
+  if (system) body.system = system;
+  if (anthropicTools.length > 0) {
+    body.tools = anthropicTools;
+    body.tool_choice = { type: 'auto' };
+  }
+
+  let upstream: globalThis.Response;
+  try {
+    upstream = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': provider.apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (fetchErr: any) {
+    const msg = fetchErr?.message || String(fetchErr);
+    console.error(`[llm] fetch failed to ${url}: ${msg}`);
+    throw new Error(`Network error reaching ${url}: ${msg}`);
+  }
+
+  if (!upstream.ok) {
+    const text = await upstream.text();
+    console.error(`[llm] anthropic returned ${upstream.status}: ${text.slice(0, 300)}`);
+    throw new Error(`Anthropic returned HTTP ${upstream.status}: ${text.slice(0, 500)}`);
+  }
+
+  const reader = upstream.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  // Accumulate tool call data across events
+  const pendingToolCalls = new Map<string, { id: string; name: string; input: string }>();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      let evt: any;
+      try { evt = JSON.parse(data); } catch { continue; }
+
+      if (evt.type === 'content_block_delta') {
+        const delta = evt.delta;
+        if (delta?.type === 'text_delta' && delta.text) {
+          send({ type: 'token', text: delta.text });
+        } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
+          // Accumulate tool input — we'll send the full tool_call on content_block_stop
+          const idx = evt.index ?? 0;
+          const key = String(idx);
+          const pending = pendingToolCalls.get(key);
+          if (pending) pending.input += delta.partial_json;
+        }
+      } else if (evt.type === 'content_block_start') {
+        const cb = evt.content_block;
+        if (cb?.type === 'tool_use') {
+          pendingToolCalls.set(String(evt.index ?? 0), {
+            id: cb.id || '',
+            name: cb.name || '',
+            input: '',
+          });
+        }
+      } else if (evt.type === 'content_block_stop') {
+        const key = String(evt.index ?? 0);
+        const pending = pendingToolCalls.get(key);
+        if (pending) {
+          send({
+            type: 'tool_call',
+            tool_call: {
+              id: pending.id,
+              type: 'function',
+              function: {
+                name: pending.name,
+                arguments: pending.input,
+              },
+            },
+          });
+          pendingToolCalls.delete(key);
+        }
+      } else if (evt.type === 'message_stop') {
+        return;
+      }
+    }
+  }
+}
+
+// -------- LLM connection test --------
+async function llmTestHandler(req: Request, res: Response): Promise<void> {
+  const { provider } = req.body as { provider: LlmProvider };
+
+  if (!provider) {
+    res.status(400).json({ ok: false, error: 'Missing provider config' });
+    return;
+  }
+  if (!provider.apiKey) {
+    res.json({ ok: false, error: 'API key not configured' });
+    return;
+  }
+  if (!provider.baseUrl) {
+    res.json({ ok: false, error: 'Base URL not configured' });
+    return;
+  }
+  if (!provider.model) {
+    res.json({ ok: false, error: 'Model not configured' });
+    return;
+  }
+
+  const t0 = Date.now();
+
+  try {
+    if (provider.type === 'anthropic') {
+      // Anthropic test: POST to /messages with a minimal message
+      const url = `${provider.baseUrl.replace(/\/\/+$/, '')}/messages`;
+      console.log(`[llm:test] anthropic ${url} model=${provider.model}`);
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': provider.apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: provider.model,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'Say OK' }],
+        }),
+      });
+      const text = await r.text();
+      const ms = Date.now() - t0;
+      if (!r.ok) {
+        console.error(`[llm:test] anthropic ${r.status}: ${text.slice(0, 300)}`);
+        res.json({ ok: false, error: `HTTP ${r.status}: ${text.slice(0, 500)}`, httpStatus: r.status, responseTime: ms, url });
+        return;
+      }
+      console.log(`[llm:test] anthropic OK in ${ms}ms`);
+      res.json({ ok: true, model: provider.model, responseTime: ms, snippet: text.slice(0, 200) });
+    } else {
+      // OpenAI-compatible test: POST to /chat/completions with a minimal message
+      const url = `${provider.baseUrl.replace(/\/\/+$/, '')}/chat/completions`;
+      console.log(`[llm:test] openai ${url} model=${provider.model}`);
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${provider.apiKey}`,
+      };
+      if (provider.id === 'openrouter') {
+        headers['HTTP-Referer'] = 'https://mobile-web-ide.local';
+        headers['X-Title'] = 'Mobile Web IDE';
+      }
+      const r = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: provider.model,
+          max_tokens: 10,
+          messages: [{ role: 'user', content: 'Say OK' }],
+        }),
+      });
+      const text = await r.text();
+      const ms = Date.now() - t0;
+      if (!r.ok) {
+        console.error(`[llm:test] openai ${r.status}: ${text.slice(0, 300)}`);
+        res.json({ ok: false, error: `HTTP ${r.status}: ${text.slice(0, 500)}`, httpStatus: r.status, responseTime: ms, url });
+        return;
+      }
+      console.log(`[llm:test] openai OK in ${ms}ms`);
+      res.json({ ok: true, model: provider.model, responseTime: ms, snippet: text.slice(0, 200) });
+    }
+  } catch (err: any) {
+    const ms = Date.now() - t0;
+    const msg = err?.message || String(err);
+    console.error(`[llm:test] error: ${msg}`);
+    res.json({ ok: false, error: `Connection failed: ${msg}`, responseTime: ms, url: `${provider.baseUrl.replace(/\/\/+$/, '')}/chat/completions` });
+  }
+}
+
+// -------- Local filesystem bridge --------
+// Provides the frontend with read/write access to the host machine's real
+// filesystem. All paths are validated against ALLOWED_ROOTS (HOME + cwd).
+
+import { homedir } from 'os';
+const ALLOWED_ROOTS = [homedir(), process.cwd()];
+
+function assertAllowed(p: string): void {
+  const resolved = path.resolve(p);
+  const ok = ALLOWED_ROOTS.some((r) => resolved.startsWith(r));
+  if (!ok) throw new Error(`Path not allowed: ${resolved}`);
+}
+
+async function localFsList(req: Request, res: Response): Promise<void> {
+  const dir = String(req.query.path || homedir());
+  assertAllowed(dir);
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const items = await Promise.all(
+    entries
+      .filter((e) => !e.name.startsWith('.'))
+      .sort((a, b) => {
+        if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      })
+      .slice(0, 500)
+      .map(async (e) => {
+        const full = path.join(dir, e.name);
+        try {
+          const st = await fs.stat(full);
+          return {
+            name: e.name,
+            path: full,
+            type: e.isDirectory() ? 'dir' : 'file',
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+          };
+        } catch {
+          return { name: e.name, path: full, type: 'file' as const, size: 0, mtimeMs: 0 };
+        }
+      }),
+  );
+  res.json({ path: dir, items });
+}
+
+async function localFsRead(req: Request, res: Response): Promise<void> {
+  const file = String(req.query.path || '');
+  if (!file) { res.status(400).json({ error: 'path required' }); return; }
+  assertAllowed(file);
+  const content = await fs.readFile(file, 'utf-8');
+  res.json({ path: file, content });
+}
+
+async function localFsWrite(req: Request, res: Response): Promise<void> {
+  const { path: fpath, content } = req.body as { path: string; content: string };
+  if (!fpath) { res.status(400).json({ error: 'path required' }); return; }
+  assertAllowed(fpath);
+  await fs.mkdir(path.dirname(fpath), { recursive: true });
+  await fs.writeFile(fpath, content, 'utf-8');
+  res.json({ ok: true, path: fpath, bytes: content.length });
+}
+
+async function localFsMkdir(req: Request, res: Response): Promise<void> {
+  const { path: fpath } = req.body as { path: string };
+  if (!fpath) { res.status(400).json({ error: 'path required' }); return; }
+  assertAllowed(fpath);
+  await fs.mkdir(fpath, { recursive: true });
+  res.json({ ok: true, path: fpath });
+}
+
+async function localFsRename(req: Request, res: Response): Promise<void> {
+  const { from, to } = req.body as { from: string; to: string };
+  if (!from || !to) { res.status(400).json({ error: 'from and to required' }); return; }
+  assertAllowed(from);
+  assertAllowed(to);
+  await fs.mkdir(path.dirname(to), { recursive: true });
+  await fs.rename(from, to);
+  res.json({ ok: true });
+}
+
+async function localFsRemove(req: Request, res: Response): Promise<void> {
+  const fpath = String(req.query.path || '');
+  if (!fpath) { res.status(400).json({ error: 'path required' }); return; }
+  assertAllowed(fpath);
+  const st = await fs.stat(fpath);
+  if (st.isDirectory()) await fs.rm(fpath, { recursive: true });
+  else await fs.unlink(fpath);
+  res.json({ ok: true });
+}
+
+async function localFsStat(req: Request, res: Response): Promise<void> {
+  const fpath = String(req.query.path || '');
+  if (!fpath) { res.status(400).json({ error: 'path required' }); return; }
+  assertAllowed(fpath);
+  const st = await fs.stat(fpath);
+  res.json({
+    path: fpath,
+    type: st.isDirectory() ? 'dir' : 'file',
+    size: st.size,
+    mtimeMs: st.mtimeMs,
+    mode: st.mode,
+  });
 }
 
 startServer().catch((err) => {
