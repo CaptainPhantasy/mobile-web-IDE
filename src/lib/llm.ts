@@ -14,6 +14,7 @@
 // API keys are stored in the browser's KV store (IndexedDB), same as GitHub PATs.
 
 import { kvGet, kvSet } from './kv';
+import { setVaultKey, listVaultIds } from './vault';
 import { readText, writeText, readdir, mkdirp, remove, rename, stat, walk, join, exists, dirname } from './fs';
 import { findInFiles } from './search';
 
@@ -342,9 +343,9 @@ export async function executeTool(
         for (const name of entries.sort()) {
           try {
             const st = await stat(join(fullPath, name));
-            details.push(`${st.type === 'dir' ? '📁' : '📄'} ${name}${st.type === 'dir' ? '/' : ''} (${st.size} bytes)`);
+            details.push(`${st.type === 'dir' ? '[d]' : '[f]'} ${name}${st.type === 'dir' ? '/' : ''} (${st.size} bytes)`);
           } catch {
-            details.push(`❓ ${name}`);
+            details.push(`[?] ${name}`);
           }
         }
         return {
@@ -421,20 +422,62 @@ export async function executeTool(
 const KV_KEY = 'llm.providers';
 const KV_ACTIVE = 'llm.activeProvider';
 
+/** Load providers. Performs a one-time migration: any non-empty apiKey
+ *  found in IndexedDB is uploaded to the server-side vault, then the
+ *  key is blanked out in the persisted provider record. From that
+ *  point on, the client never has the key in memory longer than the
+ *  upload RTT, and never on disk at all. */
 export async function loadProviders(): Promise<Provider[]> {
   const saved = await kvGet<Provider[]>(KV_KEY);
-  if (!saved) return [...BUILTIN_PROVIDERS];
-  // Merge in any new built-in providers that weren't saved before.
-  const ids = new Set(saved.map((p) => p.id));
-  const merged = [...saved];
-  for (const bp of BUILTIN_PROVIDERS) {
-    if (!ids.has(bp.id)) merged.push({ ...bp });
+  const source: Provider[] = saved ?? [...BUILTIN_PROVIDERS];
+
+  // Migration: lift any stored keys into the vault, then blank them.
+  let migrated = false;
+  for (const p of source) {
+    if (p.apiKey && p.apiKey.trim()) {
+      const ok = await setVaultKey(p.id, p.apiKey);
+      if (ok) {
+        p.apiKey = '';
+        migrated = true;
+      }
+    }
   }
-  return merged;
+
+  // Merge in any new built-in providers that weren't saved before.
+  const ids = new Set(source.map((p) => p.id));
+  for (const bp of BUILTIN_PROVIDERS) {
+    if (!ids.has(bp.id)) source.push({ ...bp, apiKey: '' });
+  }
+
+  if (migrated || !saved) {
+    await kvSet(KV_KEY, source.map((p) => ({ ...p, apiKey: '' })));
+  }
+  return source;
 }
 
+/** Mirror for the vault: returns the set of provider IDs that have a
+ *  key configured in the server vault. */
+export async function listConfiguredProviders(): Promise<Set<string>> {
+  const ids = await listVaultIds();
+  return new Set(ids);
+}
+
+/** Persist providers without ever writing the key. Key goes to the
+ *  server-side vault via setVaultKey(); the client-side record stays
+ *  empty. */
 export async function saveProviders(providers: Provider[]): Promise<void> {
-  await kvSet(KV_KEY, providers);
+  // Strip keys before writing to IndexedDB.
+  const sanitized = providers.map((p) => ({ ...p, apiKey: '' }));
+  await kvSet(KV_KEY, sanitized);
+  // For any provider that currently holds a non-empty key in-memory,
+  // push it to the vault. Callers that want to update a key should
+  // instead call setVaultKey directly to avoid the round-trip here.
+  for (const p of providers) {
+    if (p.apiKey && p.apiKey.trim()) {
+      await setVaultKey(p.id, p.apiKey);
+      p.apiKey = ''; // scrub in-memory too
+    }
+  }
 }
 
 export async function getActiveProviderId(): Promise<string> {

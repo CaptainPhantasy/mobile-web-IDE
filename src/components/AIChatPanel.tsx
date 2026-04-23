@@ -23,7 +23,10 @@ import {
   runAgenticLoop,
   testProvider,
   TestResult,
+  listConfiguredProviders,
 } from '../lib/llm';
+import { setVaultKey, deleteVaultKey } from '../lib/vault';
+import { Glyph } from './Glyph';
 
 type Props = {
   projectDir: string;
@@ -42,11 +45,11 @@ function ToolCallCard({ call, result }: { call: ToolCall; result?: ToolResult })
   return (
     <div className="ai-tool-card" onClick={() => setOpen((o) => !o)}>
       <div className="ai-tool-header">
-        <span className="ai-tool-icon">🔧</span>
+        <span className="ai-tool-icon"><Glyph name="ext" /></span>
         <span className="ai-tool-name">{name}</span>
         {result && (
           <span className={result.success ? 'ai-tool-ok' : 'ai-tool-err'}>
-            {result.success ? '✓' : '✗'}
+            <Glyph name={result.success ? 'ok' : 'err'} />
           </span>
         )}
       </div>
@@ -129,6 +132,9 @@ function SettingsPanel({
   onTest,
   testResult,
   testing,
+  hasKey,
+  onKeyChange,
+  onKeyDelete,
 }: {
   providers: Provider[];
   activeId: string;
@@ -137,8 +143,14 @@ function SettingsPanel({
   onTest: () => void;
   testResult: TestResult | null;
   testing: boolean;
+  hasKey: Set<string>;
+  onKeyChange: (providerId: string, newKey: string) => void;
+  onKeyDelete: (providerId: string) => void;
 }) {
   const active = providers.find((p) => p.id === activeId);
+  const [keyDraft, setKeyDraft] = useState('');
+  useEffect(() => { setKeyDraft(''); }, [activeId]);
+  const keyConfigured = !!active && hasKey.has(active.id);
 
   return (
     <div className="ai-settings">
@@ -159,13 +171,38 @@ function SettingsPanel({
 
         {active && (
           <>
-            <label className="ai-label">API Key</label>
-            <input
-              type="password"
-              placeholder="sk-…"
-              value={active.apiKey}
-              onChange={(e) => onUpdate({ ...active, apiKey: e.target.value })}
-            />
+            <label className="ai-label">
+              API Key {keyConfigured && <span className="ai-key-ok" title="Stored in server vault"><Glyph name="ok" /> vaulted</span>}
+            </label>
+            <div className="row">
+              <input
+                type="password"
+                placeholder={keyConfigured ? '•••• replace key' : 'sk-…'}
+                value={keyDraft}
+                onChange={(e) => setKeyDraft(e.target.value)}
+                onBlur={() => {
+                  if (!active) return;
+                  const k = keyDraft.trim();
+                  if (k.length > 0) {
+                    onKeyChange(active.id, k);
+                    setKeyDraft('');
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+              />
+              {keyConfigured && (
+                <button
+                  onClick={() => active && onKeyDelete(active.id)}
+                  title="Remove key from vault"
+                >
+                  <Glyph name="trash" />
+                </button>
+              )}
+            </div>
 
             <label className="ai-label">Model</label>
             <input
@@ -194,16 +231,17 @@ function SettingsPanel({
             <button
               className="ai-test-btn"
               onClick={onTest}
-              disabled={testing || !active.apiKey || !active.baseUrl || !active.model}
+              disabled={testing || (!keyConfigured && !keyDraft.trim()) || !active.baseUrl || !active.model}
             >
-              {testing ? '⏳ Testing…' : '🔌 Test Connection'}
+              {testing ? 'TESTING…' : 'TEST CONNECTION'}
             </button>
 
             {/* Test Result */}
             {testResult && (
               <div className={`ai-test-result ${testResult.ok ? 'ok' : 'err'}`}>
                 <div className="ai-test-status">
-                  {testResult.ok ? '✅ Connection OK' : '❌ Connection Failed'}
+                  <Glyph name={testResult.ok ? 'ok' : 'err'} color={testResult.ok ? 'var(--c-green)' : 'var(--c-red)'} />
+                  {' '}{testResult.ok ? 'Connection OK' : 'Connection Failed'}
                   {testResult.responseTime != null && (
                     <span className="ai-test-time"> ({testResult.responseTime}ms)</span>
                   )}
@@ -247,9 +285,19 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
   const [debug, setDebug] = useState(false);
   const [testResult, setTestResult] = useState<TestResult | null>(null);
   const [testing, setTesting] = useState(false);
+  /** Provider IDs that currently have a key in the server-side vault. */
+  const [vaultedIds, setVaultedIds] = useState<Set<string>>(new Set());
 
   const logRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  const refreshVault = useCallback(async () => {
+    try {
+      setVaultedIds(await listConfiguredProviders());
+    } catch {
+      setVaultedIds(new Set());
+    }
+  }, []);
 
   // ── Load persisted state ──
   useEffect(() => {
@@ -260,8 +308,11 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
       ]);
       setProviders(saved);
       setActiveId(activeId);
+      // loadProviders() migrates any legacy in-IDB keys into the vault.
+      // Refresh our local mirror after that.
+      await refreshVault();
     })();
-  }, []);
+  }, [refreshVault]);
 
   // ── Auto-scroll ──
   useEffect(() => {
@@ -283,6 +334,32 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
     },
     [],
   );
+
+  /** Send a new key to the server vault. Client never persists it. */
+  const setProviderKey = useCallback(async (id: string, key: string) => {
+    const ok = await setVaultKey(id, key);
+    if (ok) {
+      setVaultedIds((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+      setTestResult(null);
+    }
+  }, []);
+
+  /** Remove a key from the vault. */
+  const deleteProviderKey = useCallback(async (id: string) => {
+    const ok = await deleteVaultKey(id);
+    if (ok) {
+      setVaultedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      setTestResult(null);
+    }
+  }, []);
 
   const selectProvider = useCallback(async (id: string) => {
     setActiveId(id);
@@ -314,7 +391,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
 
     const provider = providers.find((p) => p.id === activeProviderId);
     if (!provider) return;
-    if (!provider.apiKey) {
+    if (!vaultedIds.has(provider.id)) {
       setShowSettings(true);
       return;
     }
@@ -359,7 +436,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
           onError(error) {
             setMessages((prev) => [
               ...prev,
-              { role: 'assistant', content: `⚠️ Error: ${error}` },
+              { role: 'assistant', content: `Error: ${error}` },
             ]);
           },
           onComplete(allMsgs) {
@@ -374,7 +451,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
       const msg = err instanceof Error ? err.message : String(err);
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: `⚠️ Error: ${msg}` },
+        { role: 'assistant', content: `Error: ${msg}` },
       ]);
     } finally {
       setStreaming(false);
@@ -414,21 +491,21 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
             title="New conversation"
             disabled={streaming}
           >
-            ➕
+            <Glyph name="plus" />
           </button>
           <button
             className="icon-btn"
             onClick={() => setShowSettings((s) => !s)}
             title="Provider settings"
           >
-            ⚙️
+            <Glyph name="ext" />
           </button>
         </div>
       </div>
 
       {/* Provider badge */}
       <div className="ai-provider-badge">
-        <span className={`ai-status-dot ${streaming ? 'streaming' : activeProvider?.apiKey ? 'ready' : 'nokey'}`} />
+        <span className={`ai-status-dot ${streaming ? 'streaming' : (activeProvider && vaultedIds.has(activeProvider.id)) ? 'ready' : 'nokey'}`} />
         <span className="ai-provider-name">{activeProvider?.name || 'No provider'}</span>
         <span className="ai-model-name">{activeProvider?.model || ''}</span>
         <span className="ai-badge-spacer" />
@@ -452,6 +529,9 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
           onTest={handleTest}
           testResult={testResult}
           testing={testing}
+          hasKey={vaultedIds}
+          onKeyChange={setProviderKey}
+          onKeyDelete={deleteProviderKey}
         />
       )}
 
@@ -472,7 +552,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
           </div>
           <div className="ai-debug-row">
             <span className="ai-debug-key">API Key:</span>
-            <span className="ai-debug-val">{activeProvider.apiKey ? `${activeProvider.apiKey.slice(0, 8)}…${activeProvider.apiKey.slice(-4)}` : '(none)'}</span>
+            <span className="ai-debug-val">{vaultedIds.has(activeProvider.id) ? '(vaulted — server-side)' : '(none)'}</span>
           </div>
           <div className="ai-debug-row">
             <span className="ai-debug-key">Endpoint:</span>
@@ -490,7 +570,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
         {messages.length === 0 && !streaming && (
           <div className="ai-empty">
             <p>Ask me to read, write, refactor, or explain code.</p>
-            <p className="muted small">Configure a provider with ⚙️ to get started.</p>
+            <p className="muted small">Configure a provider with <Glyph name="ext" /> to get started.</p>
           </div>
         )}
         {messages.map((msg, i) => {
@@ -499,7 +579,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
           if (msg.role === 'user') {
             return (
               <div key={i} className="ai-msg ai-msg-user">
-                <div className="ai-msg-avatar">👤</div>
+                <div className="ai-msg-avatar"><Glyph name="collab" /></div>
                 <div className="ai-msg-content">{msg.content}</div>
               </div>
             );
@@ -509,7 +589,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
           const calls = toolCallsInMsg[i] || msg.tool_calls || [];
           return (
             <div key={i} className="ai-msg ai-msg-assistant">
-              <div className="ai-msg-avatar">🤖</div>
+              <div className="ai-msg-avatar"><Glyph name="ai" /></div>
               <div className="ai-msg-body">
                 {msg.content && (
                   <div className="ai-msg-content">
@@ -531,7 +611,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
         {/* Streaming indicator */}
         {streaming && streamingText && (
           <div className="ai-msg ai-msg-assistant">
-            <div className="ai-msg-avatar">🤖</div>
+            <div className="ai-msg-avatar"><Glyph name="ai" /></div>
             <div className="ai-msg-body">
               <div className="ai-msg-content streaming">
                 <Markdownish text={streamingText} />
@@ -542,7 +622,7 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
         )}
         {streaming && !streamingText && (
           <div className="ai-msg ai-msg-assistant">
-            <div className="ai-msg-avatar">🤖</div>
+            <div className="ai-msg-avatar"><Glyph name="ai" /></div>
             <div className="ai-msg-body">
               <div className="ai-msg-content muted">Thinking…</div>
             </div>
@@ -556,23 +636,23 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
           ref={inputRef}
           className="ai-input"
           placeholder={
-            activeProvider?.apiKey
+            (activeProvider && vaultedIds.has(activeProvider.id))
               ? 'Ask me anything about your code…'
-              : 'Set up a provider first (⚙️)'
+              : 'Set up a provider first (settings)'
           }
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
-          disabled={streaming || !activeProvider?.apiKey}
+          disabled={streaming || !(activeProvider && vaultedIds.has(activeProvider.id))}
           rows={2}
         />
         <button
           className="ai-send-btn"
           onClick={sendMessage}
-          disabled={streaming || !input.trim() || !activeProvider?.apiKey}
+          disabled={streaming || !input.trim() || !(activeProvider && vaultedIds.has(activeProvider.id))}
           title="Send (Enter)"
         >
-          {streaming ? '⏳' : '▶'}
+          <Glyph name={streaming ? 'spinner' : 'rocket'} />
         </button>
       </div>
     </div>
