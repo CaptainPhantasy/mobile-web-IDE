@@ -16,7 +16,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs/promises';
-import * as pty from 'node-pty';
+import { setupPtyHub } from './pty-hub';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -115,82 +115,6 @@ async function startServer(): Promise<void> {
     console.log(`[web-ide] git proxy at /api/git-proxy`);
     console.log(`[web-ide] collab websocket at /ws/collab`);
     console.log(`[web-ide] pty websocket at /ws/pty`);
-  });
-}
-
-// -------- PTY WebSocket hub --------
-// One PTY per WebSocket. Spawns the user's login shell so .zshrc, Starship,
-// FLOYD_MODE, PATH, aliases, etc. all work as if the user opened a fresh
-// iTerm2 tab. Client framing is JSON messages:
-//   client → server: {type:'open', cols, rows, cwd?} | {type:'in', data} | {type:'resize', cols, rows}
-//   server → client: {type:'out', data} | {type:'exit', code} | {type:'ready', pid, shell}
-function setupPtyHub(wss: WebSocketServer): void {
-  wss.on('connection', (ws) => {
-    let proc: pty.IPty | null = null;
-
-    const send = (obj: unknown) => {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
-    };
-
-    ws.on('message', async (raw) => {
-      let msg: { type: string; [k: string]: unknown };
-      try {
-        msg = JSON.parse(String(raw));
-      } catch {
-        return;
-      }
-      if (msg.type === 'open' && !proc) {
-        const shell = process.env.SHELL || '/bin/zsh';
-        const cols = Math.max(20, Number(msg.cols) || 80);
-        const rows = Math.max(4,  Number(msg.rows) || 24);
-        // Client may send a virtual-FS path from the IDE. node-pty/zsh
-        // needs a real on-disk path, otherwise the shell exits immediately.
-        // Resolve: use the requested cwd only if it exists on disk;
-        // otherwise fall back to the user's homedir.
-        let cwd = os.homedir();
-        if (typeof msg.cwd === 'string' && msg.cwd) {
-          try {
-            const stat = await fs.stat(msg.cwd);
-            if (stat.isDirectory()) cwd = msg.cwd;
-          } catch { /* bad path — keep homedir */ }
-        }
-        try {
-          proc = pty.spawn(shell, ['-l'], {
-            name: 'xterm-256color',
-            cols, rows, cwd,
-            env: {
-              ...process.env,
-              TERM: 'xterm-256color',
-              COLORTERM: 'truecolor',
-              TERM_PROGRAM: 'MWIDE',
-            } as Record<string, string>,
-          });
-        } catch (err) {
-          send({ type: 'exit', code: -1, error: err instanceof Error ? err.message : String(err) });
-          ws.close();
-          return;
-        }
-        send({ type: 'ready', pid: proc.pid, shell });
-        proc.onData((data) => send({ type: 'out', data }));
-        proc.onExit(({ exitCode }) => {
-          send({ type: 'exit', code: exitCode });
-          try { ws.close(); } catch { /* already closed */ }
-        });
-      } else if (msg.type === 'in' && proc && typeof msg.data === 'string') {
-        proc.write(msg.data);
-      } else if (msg.type === 'resize' && proc) {
-        const cols = Math.max(20, Number(msg.cols) || 80);
-        const rows = Math.max(4,  Number(msg.rows) || 24);
-        try { proc.resize(cols, rows); } catch { /* proc gone */ }
-      }
-    });
-
-    ws.on('close', () => {
-      if (proc) {
-        try { proc.kill(); } catch { /* already dead */ }
-        proc = null;
-      }
-    });
   });
 }
 

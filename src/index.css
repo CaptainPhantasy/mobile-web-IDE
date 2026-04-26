@@ -1452,3 +1452,102 @@ input:focus, textarea:focus, select:focus {
   max-height: 100px;
   overflow-y: auto;
 }
+
+/* ---- Terminal deck (multi-pane PTY) ---- */
+.terminal-deck {
+  background: var(--bg-1, #0a0d11);
+  color: var(--fg-0, #e6edf3);
+  border-top: 1px solid var(--border-1, #1f2630);
+}
+.terminal-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  background: var(--bg-2, #11161c);
+  border-bottom: 1px solid var(--border-1, #1f2630);
+  overflow-x: auto;
+  scrollbar-width: thin;
+  min-height: 30px;
+  flex-shrink: 0;
+}
+.terminal-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 8px;
+  font-family: 'JetBrains Mono', Monaco, ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--fg-2, #94a3b8);
+  background: transparent;
+  border-right: 1px solid var(--border-1, #1f2630);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+  position: relative;
+  transition: background 80ms linear;
+}
+.terminal-tab:hover {
+  background: var(--bg-3, #161c24);
+  color: var(--fg-1, #cbd5e1);
+}
+.terminal-tab.active {
+  background: var(--bg-1, #0a0d11);
+  color: var(--fg-0, #e6edf3);
+  box-shadow: inset 0 -2px 0 0 var(--accent-1, #A8255A);
+}
+.terminal-tab.active::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 1px;
+  background: var(--accent-1, #A8255A);
+}
+.terminal-tab-dot {
+  font-size: 10px;
+  line-height: 1;
+  width: 12px;
+  display: inline-block;
+  text-align: center;
+  color: var(--fg-3, #6e7681);
+}
+.terminal-tab.active .terminal-tab-dot { color: var(--accent-2, #57E690); }
+.terminal-tab-title { font-weight: 500; letter-spacing: 0.02em; }
+.terminal-tab-close {
+  margin-left: 6px;
+  width: 16px;
+  height: 16px;
+  border: none;
+  background: transparent;
+  color: var(--fg-3, #6e7681);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.terminal-tab-close:hover {
+  background: var(--danger-bg, rgba(220, 121, 116, 0.18));
+  color: var(--danger, #DC7974);
+}
+.terminal-tab-new {
+  width: 28px;
+  border: none;
+  background: transparent;
+  color: var(--fg-2, #94a3b8);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border-1, #1f2630);
+}
+.terminal-tab-new:hover:not(:disabled) {
+  background: var(--bg-3, #161c24);
+  color: var(--fg-0, #e6edf3);
+}
+.terminal-tab-new:disabled { opacity: 0.35; cursor: not-allowed; }
+.terminal-deck-body { position: relative; }
+.terminal-pane { position: absolute; inset: 0; flex-direction: column; }
+.terminal-host { width: 100%; height: 100%; }

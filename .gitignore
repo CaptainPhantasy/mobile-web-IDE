@@ -16,3 +16,6 @@ coverage/
 # OS / tool caches
 .Trashes
 .Spotlight-V100
+
+# Phase rollout backups (Issue 0001)
+*.bak-phase*
