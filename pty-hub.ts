@@ -1,4 +1,4 @@
-// PTY hub with persistent, resumable, multi-pane sessions.
+// PTY hub with persistent, resumable, multi-pane sessions + vault-injected env.
 //
 // Each WebSocket connection is a *client attachment*, not a *session*.
 // The session (a node-pty process + ring buffer) lives in PtySessionManager
@@ -7,19 +7,32 @@
 //
 // Wire protocol (JSON over WS):
 //   client → server:
-//     {type:'open',   sessionId?, cols, rows, cwd?}   create or resume
+//     {type:'open', sessionId?, cols, rows, cwd?,
+//                   command?, args?, vaultEnv?}        create or resume
 //     {type:'in',     data}                            stdin
 //     {type:'resize', cols, rows}                      window size
 //     {type:'kill'}                                    explicit terminate
 //   server → client:
 //     {type:'ready',  sessionId, pid, shell, resumed}  attached
-//     {type:'replay', data}                            buffered output (resume only)
+//     {type:'replay', data}                            buffered output (resume)
 //     {type:'out',    data}                            stdout
 //     {type:'exit',   code}                            pty exited
 //     {type:'kicked', reason}                          another client took over
+//
+// `command` (Phase 2): when provided, runs that command inside an interactive
+// login shell (so .zshrc is sourced, PATH is populated, FLOYD TTY Bridge
+// initializes), then drops back to the shell after the command exits so the
+// pane stays usable instead of closing.
+//
+// `vaultEnv` (Phase 2): array of `{id, envVar}` mappings. The server reads
+// the corresponding values from ~/.config/mwide-vault.json (chmod 0600,
+// same vault used by the LLM proxy) and injects them into the spawned
+// process's environment. Keys never cross the WebSocket boundary back
+// to the client.
 
 import * as pty from 'node-pty';
 import * as os from 'os';
+import * as path from 'path';
 import * as fs from 'fs/promises';
 import { randomUUID } from 'crypto';
 import type { WebSocket, WebSocketServer } from 'ws';
@@ -27,6 +40,58 @@ import type { WebSocket, WebSocketServer } from 'ws';
 const DEFAULT_BUFFER_BYTES = 64 * 1024;
 const DEFAULT_IDLE_TTL_MS  = 30 * 60 * 1000;
 const SWEEP_INTERVAL_MS    = 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Vault — read-only mirror of server.ts's vault store.
+// ---------------------------------------------------------------------------
+
+const VAULT_PATH = path.join(os.homedir(), '.config', 'mwide-vault.json');
+const ENV_VAR_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+interface VaultEnvSpec {
+  id: string;
+  envVar: string;
+}
+
+async function vaultRead(): Promise<Record<string, string>> {
+  try {
+    const txt = await fs.readFile(VAULT_PATH, 'utf-8');
+    const obj = JSON.parse(txt);
+    return (obj && typeof obj === 'object' && !Array.isArray(obj))
+      ? obj as Record<string, string>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+async function resolveVaultEnv(specs: VaultEnvSpec[]): Promise<Record<string, string>> {
+  if (!specs || specs.length === 0) return {};
+  const data = await vaultRead();
+  const env: Record<string, string> = {};
+  for (const spec of specs) {
+    if (!spec || typeof spec.id !== 'string' || typeof spec.envVar !== 'string') continue;
+    if (!ENV_VAR_RE.test(spec.envVar)) continue;
+    const value = data[spec.id];
+    if (typeof value === 'string' && value.length > 0) {
+      env[spec.envVar] = value;
+    }
+  }
+  return env;
+}
+
+// ---------------------------------------------------------------------------
+// Shell quoting for safe command + args composition inside a sh -c string.
+// ---------------------------------------------------------------------------
+
+function shellQuote(s: string): string {
+  // Single-quote everything; close-quote, escape any embedded ', re-open.
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+// ---------------------------------------------------------------------------
+// PtySession — one shell + one ring buffer + at most one attached WS.
+// ---------------------------------------------------------------------------
 
 class PtySession {
   readonly id: string;
@@ -128,6 +193,10 @@ class PtySession {
   }
 }
 
+// ---------------------------------------------------------------------------
+// PtySessionManager — owns the session map and the reaper.
+// ---------------------------------------------------------------------------
+
 class PtySessionManager {
   private readonly sessions = new Map<string, PtySession>();
   private readonly bufferCap: number;
@@ -174,7 +243,14 @@ class PtySessionManager {
     }
   }
 
-  async create(opts: { cols: number; rows: number; cwd?: string }): Promise<PtySession> {
+  async create(opts: {
+    cols: number;
+    rows: number;
+    cwd?: string;
+    command?: string;
+    args?: string[];
+    injectedEnv?: Record<string, string>;
+  }): Promise<PtySession> {
     const shell = process.env.SHELL || '/bin/zsh';
 
     let cwd = os.homedir();
@@ -185,13 +261,34 @@ class PtySessionManager {
       } catch { /* keep homedir */ }
     }
 
-    const proc = pty.spawn(shell, ['-l'], {
+    // Spawn strategy:
+    //   - No command: plain login shell, like before.
+    //   - With command: login interactive shell that runs `<cmd> <args>; exec $SHELL -l -i`.
+    //     This sources .zshrc/.zprofile (PATH, aliases, FLOYD TTY Bridge),
+    //     runs the requested tool with full env, then falls back to a fresh
+    //     interactive shell so the pane stays usable when the tool exits.
+    let spawnCmd: string;
+    let spawnArgs: string[];
+    if (typeof opts.command === 'string' && opts.command.trim().length > 0) {
+      const cmd = opts.command.trim();
+      const argList = (opts.args || []).filter((a): a is string => typeof a === 'string');
+      const tail = argList.length > 0 ? ' ' + argList.map(shellQuote).join(' ') : '';
+      const inner = `${shellQuote(cmd)}${tail}; exec ${shell} -l -i`;
+      spawnCmd = shell;
+      spawnArgs = ['-l', '-i', '-c', inner];
+    } else {
+      spawnCmd = shell;
+      spawnArgs = ['-l'];
+    }
+
+    const proc = pty.spawn(spawnCmd, spawnArgs, {
       name: 'xterm-256color',
       cols: opts.cols,
       rows: opts.rows,
       cwd,
       env: {
         ...process.env,
+        ...(opts.injectedEnv || {}),
         TERM: 'xterm-256color',
         COLORTERM: 'truecolor',
         TERM_PROGRAM: 'MWIDE',
@@ -208,6 +305,10 @@ class PtySessionManager {
     return this.sessions.size;
   }
 }
+
+// ---------------------------------------------------------------------------
+// setupPtyHub — wires WebSocketServer events to the session manager.
+// ---------------------------------------------------------------------------
 
 export function setupPtyHub(wss: WebSocketServer): void {
   const mgr = new PtySessionManager({
@@ -257,10 +358,26 @@ export function setupPtyHub(wss: WebSocketServer): void {
           }
         }
 
+        // Phase 2: extract optional command, args, vaultEnv from open message.
+        const command = typeof msg.command === 'string' ? msg.command : undefined;
+        const args = Array.isArray(msg.args)
+          ? (msg.args as unknown[]).filter((a): a is string => typeof a === 'string')
+          : undefined;
+        const vaultEnvSpecs: VaultEnvSpec[] = Array.isArray(msg.vaultEnv)
+          ? (msg.vaultEnv as unknown[]).filter((s): s is VaultEnvSpec =>
+              !!s && typeof s === 'object'
+              && typeof (s as VaultEnvSpec).id === 'string'
+              && typeof (s as VaultEnvSpec).envVar === 'string')
+          : [];
+        const injectedEnv = await resolveVaultEnv(vaultEnvSpecs);
+
         try {
           session = await mgr.create({
             cols, rows,
             cwd: typeof msg.cwd === 'string' ? msg.cwd : undefined,
+            command,
+            args,
+            injectedEnv,
           });
           session.attach(ws);
           send({

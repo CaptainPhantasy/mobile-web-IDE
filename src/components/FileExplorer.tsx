@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   FsNode,
   walk,
+  exists,
   writeText,
   remove,
   rename,
@@ -67,14 +68,21 @@ export default function FileExplorer({
   useEffect(() => {
     if (isLocal) return;
     let cancelled = false;
-    walk(root)
-      .then((t) => {
-        if (!cancelled) {
-          setTree(t);
-          setExpanded((prev) => new Set([...prev, root]));
-        }
-      })
-      .catch((e) => setErr(e.message));
+    setErr(null);
+    exists(root).then((ok) => {
+      if (!ok || cancelled) {
+        if (!cancelled) setTree(null);
+        return;
+      }
+      walk(root)
+        .then((t) => {
+          if (!cancelled) {
+            setTree(t);
+            setExpanded((prev) => new Set([...prev, root]));
+          }
+        })
+        .catch((e) => setErr(e.message));
+    });
     return () => { cancelled = true; };
   }, [root, refreshKey, isLocal]);
 

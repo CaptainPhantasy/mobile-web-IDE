@@ -43,8 +43,8 @@ import {
   seedFromRecord,
   writeText,
 } from './lib/fs';
-import { localRead, localWrite } from './lib/localfs';
-import { kvGet, kvSet } from './lib/kv';
+import { localRead, localWrite, localWorkspaceInfo, QUICK_LOCATIONS } from './lib/localfs';
+import { kvGet, kvSet, kvDel } from './lib/kv';
 import { BUILTIN_THEMES, Theme, applyTheme } from './lib/themes';
 import * as ext from './lib/extensions';
 import { Breakpoint } from './lib/debugger';
@@ -69,6 +69,12 @@ type Activity =
   | 'ai';
 
 type Tab = { path: string; dirty: boolean };
+
+type Workspace = {
+  type: 'virtual' | 'local';
+  path: string;
+  name: string;
+};
 
 const SEED_PROJECT: Record<string, string> = {
   'README.md':
@@ -109,7 +115,13 @@ export default function App() {
   const editorRef = useRef<EditorHandle | null>(null);
   const collabRef = useRef<Collab | null>(null);
   const [cursor, setCursor] = useState({ line: 1, col: 1 });
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [recentWorkspaces, setRecentWorkspaces] = useState<Workspace[]>([]);
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false);
+  const [customPath, setCustomPath] = useState('');
+  const [homeDir, setHomeDir] = useState<string | null>(null);
 
+  const bootedRef = useRef(false);
   const author = useMemo(
     () => ({ name: 'Mobile IDE User', email: 'user@webide.local' }),
     [],
@@ -128,8 +140,42 @@ export default function App() {
       if (!(await exists(sample))) {
         await seedFromRecord(sample, SEED_PROJECT);
       }
-      const lastDir = (await kvGet<string>('last.projectDir')) || sample;
-      setProjectDir((await exists(lastDir)) ? lastDir : sample);
+
+      // Fetch home dir for path resolution.
+      try {
+        const hr = await fetch('/api/fs/home');
+        if (hr.ok) { const hd = await hr.json(); if (hd?.home) setHomeDir(hd.home); }
+      } catch {}
+
+      // Restore workspace state.
+      const recent = (await kvGet<Workspace[]>('recent.workspaces')) || [];
+      setRecentWorkspaces(recent);
+      const lastWs = await kvGet<Workspace>('last.workspace');
+      if (lastWs) {
+        if (lastWs.type === 'local') {
+          try {
+            await localWorkspaceInfo(lastWs.path);
+            setLocalRoot(lastWs.path);
+            setWorkspace(lastWs);
+          } catch {
+            // Folder gone — fall through to virtual FS default.
+            const fallback = (await kvGet<string>('last.projectDir')) || sample;
+            setProjectDir((await exists(fallback)) ? fallback : sample);
+          }
+        } else {
+          if (await exists(lastWs.path)) {
+            setProjectDir(lastWs.path);
+            setWorkspace(lastWs);
+          } else {
+            const fallback = (await kvGet<string>('last.projectDir')) || sample;
+            setProjectDir((await exists(fallback)) ? fallback : sample);
+          }
+        }
+      } else {
+        // Legacy: restore from projectDir key.
+        const lastDir = (await kvGet<string>('last.projectDir')) || sample;
+        setProjectDir((await exists(lastDir)) ? lastDir : sample);
+      }
 
       const savedThemeId = (await kvGet<string>('theme.id')) || 'dark';
       const t = BUILTIN_THEMES.find((x) => x.id === savedThemeId) || BUILTIN_THEMES[0];
@@ -148,6 +194,7 @@ export default function App() {
       refreshCommands();
 
       setThemes(ext.host.listThemes());
+      bootedRef.current = true;
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -157,6 +204,13 @@ export default function App() {
     setTabs([]);
     setActive(undefined);
   }, [projectDir]);
+
+  // Persist workspace + recent list whenever they change.
+  useEffect(() => {
+    if (!bootedRef.current) return;
+    if (workspace) kvSet('last.workspace', workspace);
+    kvSet('recent.workspaces', recentWorkspaces.slice(0, 20));
+  }, [workspace, recentWorkspaces]);
 
   useEffect(() => {
     (window as any).__WEBIDE_ACTIVE_PATH = active;
@@ -204,6 +258,66 @@ export default function App() {
     },
     [],
   );
+
+  // --- workspace management ---
+  function resolvePath(p: string): string {
+    if (!homeDir) return p;
+    if (p === '~') return homeDir;
+    if (p.startsWith('~/')) return homeDir + p.slice(1);
+    return p;
+  }
+
+  const openWorkspace = useCallback((type: 'virtual' | 'local', path: string) => {
+    const name = path.split('/').pop() || path;
+    const ws: Workspace = { type, path, name };
+    setWorkspace(ws);
+    if (type === 'local') {
+      setLocalRoot(path);
+    } else {
+      setLocalRoot(null);
+      setProjectDir(path);
+    }
+    setTabs([]);
+    setActive(undefined);
+    setRecentWorkspaces((prev) => {
+      const filtered = prev.filter((w) => !(w.path === path && w.type === type));
+      return [ws, ...filtered].slice(0, 20);
+    });
+  }, []);
+
+  const closeWorkspace = useCallback(() => {
+    setWorkspace(null);
+    setLocalRoot(null);
+    const sample = join(ROOT, 'sample');
+    setProjectDir(sample);
+    setTabs([]);
+    setActive(undefined);
+    kvDel('last.workspace');
+  }, []);
+
+  async function handleOpenFolder(rawPath: string) {
+    const p = resolvePath(rawPath);
+    setFolderPickerOpen(false);
+    try {
+      const info = await localWorkspaceInfo(p);
+      openWorkspace('local', p);
+      setNotification(`Opened folder: ${info.name}${info.hasGit ? ' (git)' : ''}`);
+    } catch (err) {
+      setNotification(`Cannot open folder: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  function handleOpenCustomFolder() {
+    const p = customPath.trim();
+    if (p) {
+      setCustomPath('');
+      handleOpenFolder(p);
+    }
+  }
+
+  function removeRecentWorkspace(path: string) {
+    setRecentWorkspaces((prev) => prev.filter((w) => w.path !== path));
+  }
 
   const onChange = useCallback(
     (text: string) => {
@@ -365,6 +479,18 @@ export default function App() {
         pickTheme(next);
       },
     });
+    ext.host.registerCommand({
+      id: 'workspace.openFolder',
+      title: 'Workspace: Open folder',
+      category: 'Workspace',
+      run: () => setFolderPickerOpen(true),
+    });
+    ext.host.registerCommand({
+      id: 'workspace.close',
+      title: 'Workspace: Close folder',
+      category: 'Workspace',
+      run: closeWorkspace,
+    });
   }
 
   // --- breakpoints ---
@@ -431,6 +557,9 @@ export default function App() {
   const projectRel = projectDir.replace(ROOT + '/', '');
   const crumbs = projectRel.split('/').filter(Boolean);
   const crumbClass = (i: number) => ['crumb-a', 'crumb-b', 'crumb-c'][i % 3];
+  const workspaceLabel = workspace
+    ? (workspace.type === 'local' ? workspace.name : workspace.path.split('/').pop() || workspace.path)
+    : null;
 
   return (
     <div className="ide" data-theme={theme.id}>
@@ -450,8 +579,16 @@ export default function App() {
             <span className="brand-dim">IDE</span>
           </span>
         </div>
-        <div className="topbar-project" title={projectRel}>
-          {crumbs.length === 0 ? (
+        <div className="topbar-project" title={workspaceLabel || projectRel}>
+          {workspace ? (
+            <span
+              className="crumb-a"
+              style={{ cursor: 'pointer' }}
+              onClick={() => setFolderPickerOpen(true)}
+            >
+              <Glyph name="folder_open" /> {workspaceLabel}
+            </span>
+          ) : crumbs.length === 0 ? (
             <span className="crumb-a">~</span>
           ) : (
             crumbs.map((c, i) => (
@@ -462,6 +599,13 @@ export default function App() {
             ))
           )}
         </div>
+        <button
+          className="icon-btn"
+          onClick={() => setFolderPickerOpen(true)}
+          title="Open folder"
+        >
+          <Glyph name="folder_open" />
+        </button>
         <div className="topbar-spacer" />
         <ThemePicker themes={themes} current={theme.id} onPick={pickTheme} />
         <button className="icon-btn" onClick={() => setPalOpen(true)} title="Command palette">
@@ -511,7 +655,13 @@ export default function App() {
                 onChange={() => setTree((k) => k + 1)}
                 refreshKey={tree}
                 localRoot={localRoot}
-                onLocalRootChange={setLocalRoot}
+                onLocalRootChange={(path) => {
+                  if (path) {
+                    openWorkspace('local', path);
+                  } else {
+                    closeWorkspace();
+                  }
+                }}
               />
             )}
             {activity === 'search' && (
@@ -542,7 +692,14 @@ export default function App() {
             )}
             {activity === 'ext' && <ExtensionsPanel onRefreshCommands={refreshCommands} />}
             {activity === 'projects' && (
-              <ProjectsPanel projectDir={projectDir} onOpen={setProjectDir} />
+              <ProjectsPanel
+                projectDir={projectDir}
+                onOpen={(dir) => openWorkspace('virtual', dir)}
+                onOpenLocalFolder={() => setFolderPickerOpen(true)}
+                recentWorkspaces={recentWorkspaces}
+                onOpenWorkspace={(ws) => openWorkspace(ws.type, ws.path)}
+                onRemoveWorkspace={removeRecentWorkspace}
+              />
             )}
             {activity === 'collab' && (
               <CollabPanel
@@ -610,13 +767,32 @@ export default function App() {
               <div className="empty-editor">
                 <h2>Mobile Web IDE</h2>
                 <p className="tagline">// a terminal-native development surface</p>
-                <p>
-                  Pick a file from the Files panel, clone a GitHub repo from Source
-                  Control, or create a new project to begin.
-                </p>
+                <button
+                  className="welcome-open-folder"
+                  onClick={() => setFolderPickerOpen(true)}
+                >
+                  <Glyph name="folder_open" /> Open Folder
+                </button>
+                {recentWorkspaces.length > 0 && (
+                  <div className="welcome-recent">
+                    <h3>Recent</h3>
+                    {recentWorkspaces.slice(0, 8).map((ws) => (
+                      <button
+                        key={ws.type + ':' + ws.path}
+                        className="welcome-recent-item"
+                        onClick={() => openWorkspace(ws.type, ws.path)}
+                      >
+                        <span className="welcome-recent-name">
+                          <Glyph name={ws.type === 'local' ? 'folder_open' : 'files'} /> {ws.name}
+                        </span>
+                        <span className="welcome-recent-path">{ws.path}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <ul>
                   <li><Glyph name="files"    /><b>Files</b>       <span>explore &amp; edit</span></li>
-                  <li><Glyph name="search"   /><b>Search</b>      <span>find in files, symbols, files</span></li>
+                  <li><Glyph name="search"   /><b>Search</b>      <span>find in files, symbols, references</span></li>
                   <li><Glyph name="git"      /><b>Source</b>      <span>clone, commit, push, branch</span></li>
                   <li><Glyph name="debug"    /><b>Run</b>         <span>breakpoints, logs, step</span></li>
                   <li><Glyph name="drive"    /><b>Drive</b>       <span>import / export with Google Drive</span></li>
@@ -695,6 +871,65 @@ export default function App() {
         </section>
       )}
 
+      {/* Folder picker modal */}
+      {folderPickerOpen && (
+        <div className="fp-overlay" onClick={() => setFolderPickerOpen(false)}>
+          <div className="fp-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="fp-header">
+              <span><Glyph name="folder_open" /> Open Folder</span>
+              <button className="icon-btn" onClick={() => setFolderPickerOpen(false)}>
+                <Glyph name="close" />
+              </button>
+            </div>
+            <div className="fp-section">
+              <div className="fp-section-title">Quick Access</div>
+              {QUICK_LOCATIONS.map((loc) => (
+                <button
+                  key={loc.path}
+                  className="fp-item"
+                  onClick={() => handleOpenFolder(loc.path)}
+                >
+                  <span className="fp-item-label">{loc.label}</span>
+                  <span className="fp-item-path">{loc.path}</span>
+                </button>
+              ))}
+              <div className="fp-custom-row">
+                <input
+                  className="fp-custom-input"
+                  type="text"
+                  placeholder="Custom path…"
+                  value={customPath}
+                  onChange={(e) => setCustomPath(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleOpenCustomFolder(); }}
+                />
+                <button className="fp-custom-go" onClick={handleOpenCustomFolder} disabled={!customPath.trim()}>
+                  Open
+                </button>
+              </div>
+            </div>
+            {recentWorkspaces.length > 0 && (
+              <div className="fp-section">
+                <div className="fp-section-title">Recent</div>
+                {recentWorkspaces.slice(0, 10).map((ws) => (
+                  <button
+                    key={ws.type + ':' + ws.path}
+                    className="fp-item"
+                    onClick={() => {
+                      setFolderPickerOpen(false);
+                      openWorkspace(ws.type, ws.path);
+                    }}
+                  >
+                    <span className="fp-item-label">
+                      <Glyph name={ws.type === 'local' ? 'folder_open' : 'files'} /> {ws.name}
+                    </span>
+                    <span className="fp-item-path">{ws.path}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
       <CommandPalette
         open={palOpen}
         commands={cmds}

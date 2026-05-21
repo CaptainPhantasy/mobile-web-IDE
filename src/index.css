@@ -1551,3 +1551,240 @@ input:focus, textarea:focus, select:focus {
 .terminal-deck-body { position: relative; }
 .terminal-pane { position: absolute; inset: 0; flex-direction: column; }
 .terminal-host { width: 100%; height: 100%; }
+
+/* ---- Terminal profile picker (Phase 2: launcher + vault env) ---- */
+.terminal-tab-new-wrap {
+  display: inline-flex;
+  align-items: stretch;
+}
+.terminal-profile-picker {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 50;
+  min-width: 200px;
+  background: var(--bg-2, #11161c);
+  border: 1px solid var(--border-1, #1f2630);
+  border-top: none;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+}
+.terminal-profile-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  color: var(--fg-1, #cbd5e1);
+  font-family: 'JetBrains Mono', Monaco, ui-monospace, monospace;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 60ms linear;
+}
+.terminal-profile-option:hover {
+  background: var(--bg-3, #161c24);
+  color: var(--fg-0, #e6edf3);
+}
+.terminal-profile-option-name {
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.terminal-profile-option-meta {
+  font-size: 10px;
+  color: var(--fg-3, #6e7681);
+  letter-spacing: 0;
+}
+
+/* ---------- folder picker (workspace open) ---------- */
+.fp-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+}
+.fp-modal {
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: min(460px, 92vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 16px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+.fp-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  font-weight: 600;
+  font-size: 14px;
+  gap: 8px;
+}
+.fp-section { margin-bottom: 12px; }
+.fp-section-title {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  margin-bottom: 6px;
+  padding-left: 4px;
+}
+.fp-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-1);
+  color: var(--fg-1);
+  cursor: pointer;
+  width: 100%;
+  font-family: inherit;
+  font-size: 12px;
+  margin-bottom: 3px;
+  text-align: left;
+  transition: background 60ms linear;
+}
+.fp-item:hover { background: var(--bg-2); }
+.fp-item-label { font-weight: 500; }
+.fp-item-path { font-size: 10px; color: var(--fg-3); max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-item-custom { border-style: dashed; }
+.fp-custom-row { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
+.fp-custom-input {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px 8px;
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  outline: none;
+  box-shadow: inset 0 1px 0 var(--border-lo);
+}
+.fp-custom-input:focus {
+  border-color: var(--c-magenta);
+  box-shadow: inset 0 -1px 0 var(--c-magenta);
+}
+.fp-custom-input::placeholder { color: var(--fg-3); }
+.fp-custom-go {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 6px 12px;
+  background: var(--c-magenta);
+  color: var(--bg-0);
+  border: 1px solid var(--c-magenta);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fp-custom-go:hover:not(:disabled) { opacity: 0.85; }
+.fp-custom-go:disabled { opacity: 0.35; cursor: not-allowed; }
+
+/* ---------- welcome screen workspace ---------- */
+.welcome-open-folder {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 24px;
+  margin: 12px 0;
+  background: var(--c-magenta, #c678dd);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: opacity 80ms linear;
+}
+.welcome-open-folder:hover { opacity: 0.85; }
+.welcome-recent {
+  margin: 8px 0 16px;
+  text-align: left;
+}
+.welcome-recent h3 {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  margin-bottom: 6px;
+}
+.welcome-recent-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-1);
+  color: var(--fg-1);
+  cursor: pointer;
+  width: 100%;
+  font-family: inherit;
+  font-size: 12px;
+  margin-bottom: 3px;
+  text-align: left;
+  transition: background 60ms linear;
+}
+.welcome-recent-item:hover { background: var(--bg-2); }
+.welcome-recent-name { font-weight: 500; }
+.welcome-recent-path { font-size: 10px; color: var(--fg-3); max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- projects panel workspace section ---------- */
+.panel-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  background: var(--c-magenta, #c678dd);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: opacity 80ms linear;
+}
+.panel-btn-primary:hover { opacity: 0.85; }
+.recent-workspaces { margin-bottom: 8px; }
+.recent-ws-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0;
+}
+.recent-ws-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-1);
+  color: var(--fg-1);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  flex: 1;
+  text-align: left;
+  margin-right: 4px;
+  transition: background 60ms linear;
+}
+.recent-ws-btn:hover { background: var(--bg-2); }
+.recent-ws-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

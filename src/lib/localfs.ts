@@ -113,3 +113,20 @@ export async function localStat(filePath: string): Promise<{
   }
   return r.json();
 }
+
+export type WorkspaceInfo = {
+  name: string;
+  path: string;
+  hasGit: boolean;
+  projectFiles: string[];
+  childCount: number;
+};
+
+export async function localWorkspaceInfo(dirPath: string): Promise<WorkspaceInfo> {
+  const r = await fetch(`/api/fs/workspace-info?path=${encodeURIComponent(dirPath)}`);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(formatErr(t));
+  }
+  return r.json();
+}

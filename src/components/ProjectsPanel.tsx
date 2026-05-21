@@ -1,5 +1,6 @@
 // Project management: create, open, delete, and import projects.
-// Also provides "Tasks" — a tiny per-project to-do list stored in kv.
+// Also provides workspace management: open local folders, recent workspaces,
+// and per-project task list stored in kv.
 
 import { useEffect, useState } from 'react';
 import { kvGet, kvSet } from '../lib/kv';
@@ -16,14 +17,31 @@ import {
 } from '../lib/fs';
 import { Glyph } from './Glyph';
 
+type Workspace = {
+  type: 'virtual' | 'local';
+  path: string;
+  name: string;
+};
+
 type Props = {
   projectDir: string;
   onOpen: (dir: string) => void;
+  onOpenLocalFolder?: () => void;
+  recentWorkspaces?: Workspace[];
+  onOpenWorkspace?: (ws: Workspace) => void;
+  onRemoveWorkspace?: (path: string) => void;
 };
 
 type Task = { id: string; title: string; done: boolean };
 
-export default function ProjectsPanel({ projectDir, onOpen }: Props) {
+export default function ProjectsPanel({
+  projectDir,
+  onOpen,
+  onOpenLocalFolder,
+  recentWorkspaces = [],
+  onOpenWorkspace,
+  onRemoveWorkspace,
+}: Props) {
   const [projects, setProjects] = useState<string[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [newProj, setNewProj] = useState('');
@@ -93,6 +111,48 @@ export default function ProjectsPanel({ projectDir, onOpen }: Props) {
 
   return (
     <div className="panel projects-panel">
+      {/* Open Folder — always visible at top */}
+      {onOpenLocalFolder && (
+        <>
+          <div className="panel-header">
+            <div className="panel-title">Workspace</div>
+          </div>
+          <button
+            className="panel-btn-primary"
+            onClick={onOpenLocalFolder}
+            style={{ width: '100%', marginBottom: 8 }}
+          >
+            <Glyph name="folder_open" /> Open Folder
+          </button>
+
+          {/* Recent workspaces */}
+          {recentWorkspaces.length > 0 && (
+            <div className="recent-workspaces">
+              {recentWorkspaces.slice(0, 8).map((ws) => (
+                <div key={ws.type + ':' + ws.path} className="recent-ws-row">
+                  <button
+                    className="recent-ws-btn"
+                    onClick={() => onOpenWorkspace?.(ws)}
+                    title={ws.path}
+                  >
+                    <Glyph name={ws.type === 'local' ? 'folder_open' : 'files'} />
+                    <span className="recent-ws-name">{ws.name}</span>
+                  </button>
+                  <button
+                    className="icon-btn"
+                    onClick={() => onRemoveWorkspace?.(ws.path)}
+                    title="Remove from recent"
+                  >
+                    <Glyph name="close" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Virtual FS projects */}
       <div className="panel-header">
         <div className="panel-title">Projects</div>
       </div>
@@ -119,6 +179,7 @@ export default function ProjectsPanel({ projectDir, onOpen }: Props) {
         )}
       </div>
 
+      {/* Tasks */}
       <div className="panel-header">
         <div className="panel-title">Tasks</div>
       </div>

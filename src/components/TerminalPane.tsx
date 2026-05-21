@@ -9,14 +9,37 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 
 export type PaneStatus = 'connecting' | 'live' | 'resumed' | 'closed' | 'error';
 
+/** Vault entry → environment variable mapping. The id refers to a key in
+ *  ~/.config/mwide-vault.json; the server reads the value and injects it
+ *  into the spawned PTY's env as `envVar`. Values never round-trip back
+ *  to the client. */
+export type VaultEnvSpec = { id: string; envVar: string };
+
+/** Profile data sent on the *first* open for a pane. Once a sessionId is
+ *  stored in localStorage (i.e. a session is alive on the server), profile
+ *  is ignored on resume — the existing shell + env are reused. */
+export type PaneProfile = {
+  /** Human label shown in the tab. */
+  title: string;
+  /** Absolute path or PATH-resolvable executable. Omit for a plain shell. */
+  command?: string;
+  /** Arguments passed to `command`. */
+  args?: string[];
+  /** Vault keys to inject as env vars before spawn. */
+  vaultEnv?: VaultEnvSpec[];
+};
+
 type Props = {
   paneKey: string;
   projectDir: string;
   isVisible: boolean;
+  /** First-launch configuration. Ignored on resume. */
+  profile?: PaneProfile;
   onStatusChange?: (status: PaneStatus) => void;
   onSessionId?: (sessionId: string) => void;
   killSignal?: number;
 };
+
 
 const THEME: ITheme = {
   foreground: '#e6edf3',
@@ -66,6 +89,7 @@ export default function TerminalPane({
   paneKey,
   projectDir,
   isVisible,
+  profile,
   onStatusChange,
   onSessionId,
   killSignal,
@@ -122,12 +146,23 @@ export default function TerminalPane({
       if (cancelled) return;
       const { cols, rows } = term;
       const stored = readStoredSessionId(paneKey, projectDir);
-      ws.send(JSON.stringify({
+      // Profile fields are honored only on a fresh create. If `stored` is
+      // present, the server will resume the existing PTY and silently
+      // ignore command/args/vaultEnv (they applied at original spawn time).
+      const openMsg: Record<string, unknown> = {
         type: 'open',
         sessionId: stored || undefined,
         cols, rows,
         cwd: projectDir,
-      }));
+      };
+      if (!stored && profile) {
+        if (profile.command) openMsg.command = profile.command;
+        if (profile.args && profile.args.length > 0) openMsg.args = profile.args;
+        if (profile.vaultEnv && profile.vaultEnv.length > 0) {
+          openMsg.vaultEnv = profile.vaultEnv;
+        }
+      }
+      ws.send(JSON.stringify(openMsg));
     };
 
     ws.onmessage = (ev) => {

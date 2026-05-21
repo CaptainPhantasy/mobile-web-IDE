@@ -1,12 +1,14 @@
-// Multi-pane terminal deck. Each pane owns its own xterm + WS + PTY
-// session (see TerminalPane). The deck owns the array of panes, the
-// tab strip, and persistence of the pane list across reloads.
+// Multi-pane terminal deck with launcher profiles + vault-injected env.
+// Each pane owns its own xterm + WS + PTY session (see TerminalPane).
+// The deck owns:
+//   - the array of panes (persisted across reloads)
+//   - the tab strip
+//   - the profile picker that determines what command spawns when "+" is hit
 //
-// External API is unchanged from the prior single-pane Terminal.tsx —
-// App.tsx keeps rendering <Terminal projectDir=… /> and gets a deck.
+// External API is unchanged: App.tsx renders <Terminal projectDir=… />.
 
 import { useCallback, useEffect, useState } from 'react';
-import TerminalPane, { PaneStatus } from './TerminalPane';
+import TerminalPane, { PaneStatus, PaneProfile, VaultEnvSpec } from './TerminalPane';
 
 type Props = {
   projectDir: string;
@@ -17,12 +19,70 @@ type Props = {
 
 type Pane = {
   paneKey: string;
-  title: string;
+  /** Stored profile snapshot. Re-sent on every render; the server only
+   *  applies it on first spawn (when no sessionId is in localStorage),
+   *  so this is also what survives reloads. */
+  profile: PaneProfile;
   killSignal: number;
 };
 
 const DECK_KEY_PREFIX = 'mwide:pty:deck:';
 const MAX_PANES = 8;
+
+// ---------------------------------------------------------------------------
+// Built-in launcher profiles. Paths are absolute so the spawn doesn't depend
+// on PATH being correct in non-interactive contexts. Vault keys are the
+// `id` field in ~/.config/mwide-vault.json. If a key is absent from the
+// vault the env var simply isn't set — graceful degradation, no error.
+// ---------------------------------------------------------------------------
+
+const ANTHROPIC_VAULT: VaultEnvSpec = { id: 'anthropic', envVar: 'ANTHROPIC_API_KEY' };
+const OPENAI_VAULT:    VaultEnvSpec = { id: 'openai',    envVar: 'OPENAI_API_KEY' };
+
+type ProfileTemplate = PaneProfile & { id: string };
+
+const PROFILE_TEMPLATES: ProfileTemplate[] = [
+  {
+    id: 'plain',
+    title: 'shell',
+  },
+  {
+    id: 'claude',
+    title: 'claude',
+    command: '/Users/douglastalley/.local/bin/claude',
+    vaultEnv: [ANTHROPIC_VAULT],
+  },
+  {
+    id: 'floyd',
+    title: 'floyd',
+    command: '/Users/douglastalley/.bun/bin/floyd',
+    vaultEnv: [ANTHROPIC_VAULT, OPENAI_VAULT],
+  },
+  {
+    id: 'floyd-10x',
+    title: 'floyd-10x',
+    command: '/opt/homebrew/bin/floyd-10x',
+    vaultEnv: [ANTHROPIC_VAULT, OPENAI_VAULT],
+  },
+  {
+    id: 'superfloyd',
+    title: 'superfloyd',
+    command: '/opt/homebrew/bin/superfloyd',
+    vaultEnv: [ANTHROPIC_VAULT, OPENAI_VAULT],
+  },
+];
+
+function defaultProfile(): PaneProfile {
+  // The first pane is always plain shell — keeps the workflow predictable.
+  const plain = PROFILE_TEMPLATES.find((p) => p.id === 'plain');
+  return plain
+    ? { title: plain.title, command: plain.command, args: plain.args, vaultEnv: plain.vaultEnv }
+    : { title: 'shell' };
+}
+
+// ---------------------------------------------------------------------------
+// Persistence helpers.
+// ---------------------------------------------------------------------------
 
 function deckKey(projectDir: string): string {
   return `${DECK_KEY_PREFIX}${projectDir}`;
@@ -35,10 +95,15 @@ function loadDeck(projectDir: string): Pane[] {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     return parsed
-      .filter((p): p is { paneKey: string; title: string } =>
-        p && typeof p.paneKey === 'string' && typeof p.title === 'string',
+      .filter((p): p is { paneKey: string; profile?: PaneProfile; title?: string } =>
+        p && typeof p === 'object' && typeof (p as { paneKey?: unknown }).paneKey === 'string',
       )
-      .map((p) => ({ paneKey: p.paneKey, title: p.title, killSignal: 0 }));
+      .map((p) => {
+        // Forward-compat with the Phase 1 shape that stored only `title`.
+        const profile: PaneProfile = (p as { profile?: PaneProfile }).profile
+          ?? { title: typeof p.title === 'string' ? p.title : 'shell' };
+        return { paneKey: p.paneKey, profile, killSignal: 0 };
+      });
   } catch {
     return [];
   }
@@ -46,17 +111,13 @@ function loadDeck(projectDir: string): Pane[] {
 
 function saveDeck(projectDir: string, panes: Pane[]): void {
   try {
-    const slim = panes.map(({ paneKey, title }) => ({ paneKey, title }));
+    const slim = panes.map(({ paneKey, profile }) => ({ paneKey, profile }));
     localStorage.setItem(deckKey(projectDir), JSON.stringify(slim));
   } catch { /* quota / private mode */ }
 }
 
 function newPaneKey(): string {
   return `p_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e6).toString(36)}`;
-}
-
-function defaultTitle(index: number): string {
-  return `shell ${index + 1}`;
 }
 
 function statusDot(status: PaneStatus | undefined): string {
@@ -70,17 +131,22 @@ function statusDot(status: PaneStatus | undefined): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Component.
+// ---------------------------------------------------------------------------
+
 export default function Terminal({ projectDir }: Props) {
   const [panes, setPanes] = useState<Pane[]>(() => {
     const stored = loadDeck(projectDir);
     if (stored.length > 0) return stored;
-    return [{ paneKey: newPaneKey(), title: defaultTitle(0), killSignal: 0 }];
+    return [{ paneKey: newPaneKey(), profile: defaultProfile(), killSignal: 0 }];
   });
   const [activeKey, setActiveKey] = useState<string>(() => {
     const stored = loadDeck(projectDir);
     return (stored[0]?.paneKey) || '';
   });
   const [statusByPane, setStatusByPane] = useState<Record<string, PaneStatus>>({});
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   useEffect(() => {
     if (!activeKey && panes.length > 0) setActiveKey(panes[0].paneKey);
@@ -91,17 +157,41 @@ export default function Terminal({ projectDir }: Props) {
     saveDeck(projectDir, panes);
   }, [panes, projectDir]);
 
-  const addPane = useCallback(() => {
+  // Close the picker on outside click / Escape.
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') setPickerOpen(false);
+    };
+    const onClick = (e: MouseEvent): void => {
+      const target = e.target as HTMLElement | null;
+      if (!target?.closest('.terminal-tab-new-wrap')) setPickerOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onClick);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onClick);
+    };
+  }, [pickerOpen]);
+
+  const addPane = useCallback((tpl: ProfileTemplate) => {
     setPanes((prev) => {
       if (prev.length >= MAX_PANES) return prev;
       const next: Pane = {
         paneKey: newPaneKey(),
-        title: defaultTitle(prev.length),
+        profile: {
+          title: tpl.title,
+          command: tpl.command,
+          args: tpl.args,
+          vaultEnv: tpl.vaultEnv,
+        },
         killSignal: 0,
       };
       setActiveKey(next.paneKey);
       return [...prev, next];
     });
+    setPickerOpen(false);
   }, []);
 
   const closePane = useCallback((paneKey: string) => {
@@ -119,7 +209,7 @@ export default function Terminal({ projectDir }: Props) {
       if (next.length === 0) {
         const seed: Pane = {
           paneKey: newPaneKey(),
-          title: defaultTitle(0),
+          profile: defaultProfile(),
           killSignal: 0,
         };
         setActiveKey(seed.paneKey);
@@ -141,6 +231,8 @@ export default function Terminal({ projectDir }: Props) {
     );
   }, []);
 
+  const atMax = panes.length >= MAX_PANES;
+
   return (
     <div className="terminal-deck" style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
       <div className="terminal-tabs" role="tablist" aria-label="Terminal panes">
@@ -154,14 +246,15 @@ export default function Terminal({ projectDir }: Props) {
               role="tab"
               aria-selected={active}
               className={'terminal-tab' + (active ? ' active' : '')}
+              data-profile={p.profile.title}
               onClick={() => setActiveKey(p.paneKey)}
             >
               <span className="terminal-tab-dot" aria-hidden="true">{dot}</span>
-              <span className="terminal-tab-title">{p.title}</span>
+              <span className="terminal-tab-title">{p.profile.title}</span>
               {panes.length > 1 && (
                 <button
                   className="terminal-tab-close"
-                  aria-label={`Close ${p.title}`}
+                  aria-label={`Close ${p.profile.title}`}
                   onClick={(e) => { e.stopPropagation(); closePane(p.paneKey); }}
                 >
                   ×
@@ -170,15 +263,40 @@ export default function Terminal({ projectDir }: Props) {
             </div>
           );
         })}
-        <button
-          className="terminal-tab-new"
-          aria-label="New terminal pane"
-          onClick={addPane}
-          disabled={panes.length >= MAX_PANES}
-          title={panes.length >= MAX_PANES ? `Max ${MAX_PANES} panes` : 'New pane'}
-        >
-          +
-        </button>
+
+        <div className="terminal-tab-new-wrap" style={{ position: 'relative' }}>
+          <button
+            className="terminal-tab-new"
+            aria-label="New terminal pane"
+            aria-haspopup="menu"
+            aria-expanded={pickerOpen}
+            onClick={() => !atMax && setPickerOpen((o) => !o)}
+            disabled={atMax}
+            title={atMax ? `Max ${MAX_PANES} panes` : 'New pane (pick profile)'}
+          >
+            +
+          </button>
+          {pickerOpen && (
+            <div className="terminal-profile-picker" role="menu">
+              {PROFILE_TEMPLATES.map((tpl) => (
+                <button
+                  key={tpl.id}
+                  role="menuitem"
+                  className="terminal-profile-option"
+                  onClick={() => addPane(tpl)}
+                >
+                  <span className="terminal-profile-option-name">{tpl.title}</span>
+                  {tpl.command && (
+                    <span className="terminal-profile-option-meta">
+                      {basename(tpl.command)}
+                      {tpl.vaultEnv && tpl.vaultEnv.length > 0 ? ` · ${tpl.vaultEnv.length} key${tpl.vaultEnv.length === 1 ? '' : 's'}` : ''}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="terminal-deck-body" style={{ flex: 1, minHeight: 0, position: 'relative', display: 'flex' }}>
@@ -188,6 +306,7 @@ export default function Terminal({ projectDir }: Props) {
             paneKey={p.paneKey}
             projectDir={projectDir}
             isVisible={p.paneKey === activeKey}
+            profile={p.profile}
             killSignal={p.killSignal}
             onStatusChange={(s) => onPaneStatus(p.paneKey, s)}
           />
@@ -195,4 +314,9 @@ export default function Terminal({ projectDir }: Props) {
       </div>
     </div>
   );
+}
+
+function basename(p: string): string {
+  const i = p.lastIndexOf('/');
+  return i >= 0 ? p.slice(i + 1) : p;
 }

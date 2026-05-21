@@ -6,6 +6,7 @@ import { VitePWA } from 'vite-plugin-pwa';
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '');
   return {
+    base: '/mwide/',
     plugins: [
       react(),
       VitePWA({
@@ -25,18 +26,18 @@ export default defineConfig(({ mode }) => {
           background_color: '#0a0d11',
           display: 'standalone',
           orientation: 'any',
-          scope: '/',
-          start_url: '/',
-          id: '/',
+          scope: '/mwide/',
+          start_url: '/mwide/',
+          id: '/mwide/',
           icons: [
-            { src: '/icon.svg',          sizes: 'any',     type: 'image/svg+xml', purpose: 'any' },
-            { src: '/icon-maskable.svg', sizes: 'any',     type: 'image/svg+xml', purpose: 'maskable' },
+            { src: '/mwide/icon.svg',          sizes: 'any',     type: 'image/svg+xml', purpose: 'any' },
+            { src: '/mwide/icon-maskable.svg', sizes: 'any',     type: 'image/svg+xml', purpose: 'maskable' },
           ],
           categories: ['developer', 'productivity', 'utilities'],
           // Share target: accept text / URLs / single files from other
           // apps. POSTed to /share — the client intercepts and loads.
           share_target: {
-            action: '/share',
+            action: '/mwide/share',
             method: 'POST',
             enctype: 'multipart/form-data',
             params: {
@@ -56,7 +57,7 @@ export default defineConfig(({ mode }) => {
           maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
           // Never precache /api/* — those are dynamic.
           navigateFallbackDenylist: [/^\/api\//, /^\/ws\//],
-          navigateFallback: '/index.html',
+          navigateFallback: '/mwide/index.html',
           runtimeCaching: [
             {
               // External fonts / CDN assets (we bundle ours, but just in case).
@@ -78,6 +79,7 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       hmr: process.env.DISABLE_HMR !== 'true',
+      allowedHosts: ['.tail58d565.ts.net'],
     },
     optimizeDeps: {
       include: [

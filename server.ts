@@ -69,6 +69,7 @@ async function startServer(): Promise<void> {
   app.post('/api/fs/rename', asyncHandler(localFsRename));
   app.delete('/api/fs/remove', asyncHandler(localFsRemove));
   app.get('/api/fs/stat', asyncHandler(localFsStat));
+  app.get('/api/fs/workspace-info', asyncHandler(localFsWorkspaceInfo));
 
   // --- Vite in dev / static in prod.
   if (process.env.NODE_ENV !== 'production') {
@@ -79,6 +80,10 @@ async function startServer(): Promise<void> {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
+    // Vite builds with base:'/mwide/' so URLs start with /mwide/ but
+    // files live at dist/assets/ (no mwide/ nesting on disk).
+    // Serve static at both roots so /mwide/assets/... resolves.
+    app.use('/mwide', express.static(distPath));
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
@@ -958,6 +963,40 @@ async function localFsStat(req: Request, res: Response): Promise<void> {
     mtimeMs: st.mtimeMs,
     mode: st.mode,
   });
+}
+// -------- Workspace info --------
+// Returns metadata about a directory for the workspace/folder-open UX:
+// name, git presence, detected project files, child count.
+async function localFsWorkspaceInfo(req: Request, res: Response): Promise<void> {
+  const dir = String(req.query.path || '');
+  if (!dir) { res.status(400).json({ error: 'path required' }); return; }
+  assertAllowed(dir);
+  try {
+    const st = await fs.stat(dir);
+    if (!st.isDirectory()) {
+      res.status(400).json({ error: 'Not a directory' });
+      return;
+    }
+  } catch {
+    res.status(404).json({ error: 'Path not found' });
+    return;
+  }
+  const name = path.basename(dir);
+  let hasGit = false;
+  try { await fs.stat(path.join(dir, '.git')); hasGit = true; } catch {}
+  const PROJECT_FILES = [
+    'package.json', 'Cargo.toml', 'go.mod', 'go.sum',
+    'pyproject.toml', 'requirements.txt', 'pom.xml', 'build.gradle',
+    'Makefile', 'CMakeLists.txt', 'tsconfig.json', 'deno.json',
+    'mix.exs', 'Gemfile', 'composer.json',
+  ];
+  const projectFiles: string[] = [];
+  await Promise.all(PROJECT_FILES.map(async (f) => {
+    try { await fs.stat(path.join(dir, f)); projectFiles.push(f); } catch {}
+  }));
+  let childCount = 0;
+  try { childCount = (await fs.readdir(dir)).length; } catch {}
+  res.json({ name, path: dir, hasGit, projectFiles, childCount });
 }
 
 startServer().catch((err) => {
