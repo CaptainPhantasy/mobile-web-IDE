@@ -31,6 +31,7 @@ import { Glyph } from './components/Glyph';
 import Heartbeat from './components/Heartbeat';
 import SaveIndicator from './components/SaveIndicator';
 import ErrorBoundary from './components/ErrorBoundary';
+import Cockpit from './cockpit/Cockpit';
 import MobileKeybar from './components/MobileKeybar';
 import { useAutosave } from './hooks/useAutosave';
 import { GlyphName } from './lib/glyphs';
@@ -97,6 +98,16 @@ function randomColor(seed: string): string {
 
 export default function App() {
   const [projectDir, setProjectDir] = useState<string>(join(ROOT, 'sample'));
+  const [cockpitMode, setCockpitMode] = useState<boolean>(
+    () => typeof window !== 'undefined' && window.location.hash.startsWith('#/cockpit'),
+  );
+  useEffect(() => {
+    const sync = (): void => {
+      if (window.location.hash.startsWith('#/cockpit')) setCockpitMode(true);
+    };
+    window.addEventListener('hashchange', sync);
+    return () => window.removeEventListener('hashchange', sync);
+  }, []);
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [active, setActive] = useState<string | undefined>();
   const [tree, setTree] = useState(0);
@@ -561,6 +572,19 @@ export default function App() {
     ? (workspace.type === 'local' ? workspace.name : workspace.path.split('/').pop() || workspace.path)
     : null;
 
+  if (cockpitMode) {
+    return (
+      <ErrorBoundary label="cockpit">
+        <Cockpit
+          onExitToIde={() => {
+            setCockpitMode(false);
+            if (window.location.hash.startsWith('#/cockpit')) window.location.hash = '';
+          }}
+        />
+      </ErrorBoundary>
+    );
+  }
+
   return (
     <div className="ide" data-theme={theme.id}>
       {/* top bar */}
@@ -607,6 +631,17 @@ export default function App() {
           <Glyph name="folder_open" />
         </button>
         <div className="topbar-spacer" />
+        <button
+          className="icon-btn"
+          style={{ width: 'auto', padding: '0 10px', fontWeight: 600 }}
+          onClick={() => {
+            setCockpitMode(true);
+            if (!window.location.hash.startsWith('#/cockpit')) window.location.hash = '#/cockpit';
+          }}
+          title="Open Cockpit mode"
+        >
+          Cockpit
+        </button>
         <ThemePicker themes={themes} current={theme.id} onPick={pickTheme} />
         <button className="icon-btn" onClick={() => setPalOpen(true)} title="Command palette">
           <Glyph name="palette" />
