@@ -17,6 +17,7 @@ import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs/promises';
 import { setupPtyHub } from './pty-hub';
+import { createCockpitRouter } from './server/cockpit/router';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,6 +71,9 @@ async function startServer(): Promise<void> {
   app.delete('/api/fs/remove', asyncHandler(localFsRemove));
   app.get('/api/fs/stat', asyncHandler(localFsStat));
   app.get('/api/fs/workspace-info', asyncHandler(localFsWorkspaceInfo));
+
+  // --- Cockpit API (operations cockpit). Auth via MWIDE_COCKPIT_TOKEN when configured.
+  app.use('/api/cockpit', createCockpitRouter());
 
   // --- Vite in dev / static in prod.
   if (process.env.NODE_ENV !== 'production') {

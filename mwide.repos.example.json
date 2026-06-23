@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "auth": {
+    "required": true,
+    "tokenEnv": "MWIDE_COCKPIT_TOKEN"
+  },
+  "workspaceRoots": [
+    "/Volumes/SanDisk1Tb/MWIDE",
+    "/Volumes/SanDisk1Tb"
+  ],
+  "repos": [
+    {
+      "id": "mobile-web-ide",
+      "label": "Mobile Web IDE",
+      "path": "/Volumes/SanDisk1Tb/MWIDE/mobile-web-IDE",
+      "github": "CaptainPhantasy/mobile-web-IDE",
+      "packageManager": "npm",
+      "defaultBranch": "main",
+      "actions": [
+        {
+          "id": "git-status",
+          "label": "Git Status",
+          "kind": "read",
+          "command": "git",
+          "args": ["status", "--short"],
+          "confirm": false
+        },
+        {
+          "id": "pull-ff-only",
+          "label": "Pull Fast-Forward Only",
+          "kind": "write",
+          "command": "git",
+          "args": ["pull", "--ff-only"],
+          "confirm": true
+        },
+        {
+          "id": "typecheck",
+          "label": "Typecheck",
+          "kind": "verify",
+          "command": "npm",
+          "args": ["run", "lint"],
+          "confirm": false
+        },
+        {
+          "id": "build",
+          "label": "Build",
+          "kind": "verify",
+          "command": "npm",
+          "args": ["run", "build"],
+          "confirm": false
+        }
+      ]
+    },
+    {
+      "id": "example-app",
+      "label": "Example App (template — replace or remove)",
+      "path": "/Volumes/SanDisk1Tb/MWIDE/example-app",
+      "github": "owner/example-app",
+      "packageManager": "npm",
+      "defaultBranch": "main",
+      "actions": [
+        {
+          "id": "git-status",
+          "label": "Git Status",
+          "kind": "read",
+          "command": "git",
+          "args": ["status", "--short"],
+          "confirm": false
+        }
+      ]
+    }
+  ]
+}

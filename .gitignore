@@ -19,3 +19,9 @@ coverage/
 
 # Phase rollout backups (Issue 0001)
 *.bak-phase*
+
+.env
+
+# Cockpit local config + audit (never commit)
+mwide.repos.json
+mwide.audit.log
