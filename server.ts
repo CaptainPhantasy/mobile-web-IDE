@@ -18,6 +18,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs/promises';
 import { setupPtyHub } from './pty-hub';
 import { createCockpitRouter } from './server/cockpit/router';
+import { getRepoStatus } from './server/cockpit/git-status';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,6 +59,7 @@ async function startServer(): Promise<void> {
   //     host machine's real filesystem through the server.
   //     Scoped to HOME by default; rejects paths outside allowed roots.
   app.get('/api/fs/home', (_req, res) => res.json({ home: homedir() }));
+  app.get('/api/fs/default-workspace', asyncHandler(localFsDefaultWorkspace));
   app.get('/api/fs/list', asyncHandler(localFsList));
 
   // --- API key vault (server-local file, 0600, HOME-based).
@@ -70,6 +72,7 @@ async function startServer(): Promise<void> {
   app.post('/api/fs/rename', asyncHandler(localFsRename));
   app.delete('/api/fs/remove', asyncHandler(localFsRemove));
   app.get('/api/fs/stat', asyncHandler(localFsStat));
+  app.get('/api/fs/git-status', asyncHandler(localFsGitStatus));
   app.get('/api/fs/workspace-info', asyncHandler(localFsWorkspaceInfo));
 
   // --- Cockpit API (operations cockpit). Auth via MWIDE_COCKPIT_TOKEN when configured.
@@ -968,6 +971,72 @@ async function localFsStat(req: Request, res: Response): Promise<void> {
     mode: st.mode,
   });
 }
+
+async function localFsGitStatus(req: Request, res: Response): Promise<void> {
+  const dir = String(req.query.path || '');
+  if (!dir) { res.status(400).json({ error: 'path required' }); return; }
+  assertAllowed(dir);
+  try {
+    const st = await fs.stat(dir);
+    if (!st.isDirectory()) {
+      res.status(400).json({ error: 'Not a directory' });
+      return;
+    }
+  } catch {
+    res.status(404).json({ error: 'Path not found' });
+    return;
+  }
+  const status = await getRepoStatus({
+    id: path.basename(dir),
+    label: path.basename(dir),
+    path: dir,
+    actions: [],
+  });
+  res.json(status);
+}
+
+async function localFsDefaultWorkspace(_req: Request, res: Response): Promise<void> {
+  const dir = process.cwd();
+  assertAllowed(dir);
+  const status = await getRepoStatus({
+    id: path.basename(dir),
+    label: path.basename(dir),
+    path: dir,
+    actions: [],
+  });
+  if (!status.exists || !status.branch) {
+    res.json({ workspace: null });
+    return;
+  }
+  const info = await getWorkspaceInfo(dir);
+  res.json({ workspace: info });
+}
+
+async function getWorkspaceInfo(dir: string): Promise<{
+  name: string;
+  path: string;
+  hasGit: boolean;
+  projectFiles: string[];
+  childCount: number;
+}> {
+  const name = path.basename(dir);
+  let hasGit = false;
+  try { await fs.stat(path.join(dir, '.git')); hasGit = true; } catch {}
+  const PROJECT_FILES = [
+    'package.json', 'Cargo.toml', 'go.mod', 'go.sum',
+    'pyproject.toml', 'requirements.txt', 'pom.xml', 'build.gradle',
+    'Makefile', 'CMakeLists.txt', 'tsconfig.json', 'deno.json',
+    'mix.exs', 'Gemfile', 'composer.json',
+  ];
+  const projectFiles: string[] = [];
+  await Promise.all(PROJECT_FILES.map(async (f) => {
+    try { await fs.stat(path.join(dir, f)); projectFiles.push(f); } catch {}
+  }));
+  let childCount = 0;
+  try { childCount = (await fs.readdir(dir)).length; } catch {}
+  return { name, path: dir, hasGit, projectFiles, childCount };
+}
+
 // -------- Workspace info --------
 // Returns metadata about a directory for the workspace/folder-open UX:
 // name, git presence, detected project files, child count.
@@ -985,22 +1054,7 @@ async function localFsWorkspaceInfo(req: Request, res: Response): Promise<void> 
     res.status(404).json({ error: 'Path not found' });
     return;
   }
-  const name = path.basename(dir);
-  let hasGit = false;
-  try { await fs.stat(path.join(dir, '.git')); hasGit = true; } catch {}
-  const PROJECT_FILES = [
-    'package.json', 'Cargo.toml', 'go.mod', 'go.sum',
-    'pyproject.toml', 'requirements.txt', 'pom.xml', 'build.gradle',
-    'Makefile', 'CMakeLists.txt', 'tsconfig.json', 'deno.json',
-    'mix.exs', 'Gemfile', 'composer.json',
-  ];
-  const projectFiles: string[] = [];
-  await Promise.all(PROJECT_FILES.map(async (f) => {
-    try { await fs.stat(path.join(dir, f)); projectFiles.push(f); } catch {}
-  }));
-  let childCount = 0;
-  try { childCount = (await fs.readdir(dir)).length; } catch {}
-  res.json({ name, path: dir, hasGit, projectFiles, childCount });
+  res.json(await getWorkspaceInfo(dir));
 }
 
 startServer().catch((err) => {

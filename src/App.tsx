@@ -13,10 +13,9 @@
 // activity bar moves to the bottom as a fixed tab strip (thumb-reach
 // friendly). The editor uses CodeMirror's touch-aware selection handles.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import FileExplorer from './components/FileExplorer';
 import Terminal from './components/Terminal';
-import GitPanel from './components/GitPanel';
 import SearchPanel from './components/SearchPanel';
 import DebugPanel from './components/DebugPanel';
 import ProjectsPanel from './components/ProjectsPanel';
@@ -25,13 +24,13 @@ import DrivePanel from './components/DrivePanel';
 import CollabPanel from './components/CollabPanel';
 import CommandPalette from './components/CommandPalette';
 import ThemePicker from './components/ThemePicker';
-import AIChatPanel from './components/AIChatPanel';
 import CodeEditor, { EditorHandle } from './components/Editor';
 import { Glyph } from './components/Glyph';
 import Heartbeat from './components/Heartbeat';
 import SaveIndicator from './components/SaveIndicator';
 import ErrorBoundary from './components/ErrorBoundary';
 import Cockpit from './cockpit/Cockpit';
+import { useDeviceClass } from './cockpit/device';
 import MobileKeybar from './components/MobileKeybar';
 import { useAutosave } from './hooks/useAutosave';
 import { GlyphName } from './lib/glyphs';
@@ -42,10 +41,24 @@ import {
   join,
   readText,
   seedFromRecord,
+  writeBytes,
   writeText,
 } from './lib/fs';
-import { localRead, localWrite, localWorkspaceInfo, QUICK_LOCATIONS } from './lib/localfs';
+import { localDefaultWorkspace, localRead, localWrite, localWorkspaceInfo, QUICK_LOCATIONS } from './lib/localfs';
 import { kvGet, kvSet, kvDel } from './lib/kv';
+import {
+  BrowserWorkspace,
+  browserRootPath,
+  isBrowserPath,
+  isNativeAvailable,
+  isWebkitFallback,
+  parseBrowserPath,
+  pickDirectory,
+  readBrowserFile,
+  restoreDirectory,
+  writeBrowserFile,
+} from './lib/browserfs';
+import { Workspace, WorkspaceType, workspaceKey } from './lib/workspace';
 import { BUILTIN_THEMES, Theme, applyTheme } from './lib/themes';
 import * as ext from './lib/extensions';
 import { Breakpoint } from './lib/debugger';
@@ -57,6 +70,9 @@ import {
   extractToFunction,
   toggleLineComment,
 } from './lib/refactor';
+
+const GitPanel = lazy(() => import('./components/GitPanel'));
+const AIChatPanel = lazy(() => import('./components/AIChatPanel'));
 
 type Activity =
   | 'files'
@@ -70,12 +86,6 @@ type Activity =
   | 'ai';
 
 type Tab = { path: string; dirty: boolean };
-
-type Workspace = {
-  type: 'virtual' | 'local';
-  path: string;
-  name: string;
-};
 
 const SEED_PROJECT: Record<string, string> = {
   'README.md':
@@ -97,6 +107,7 @@ function randomColor(seed: string): string {
 }
 
 export default function App() {
+  const ideVertical = useDeviceClass();
   const [projectDir, setProjectDir] = useState<string>(join(ROOT, 'sample'));
   const [cockpitMode, setCockpitMode] = useState<boolean>(
     () => typeof window !== 'undefined' && window.location.hash.startsWith('#/cockpit'),
@@ -127,10 +138,12 @@ export default function App() {
   const collabRef = useRef<Collab | null>(null);
   const [cursor, setCursor] = useState({ line: 1, col: 1 });
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [browserWorkspace, setBrowserWorkspace] = useState<BrowserWorkspace | null>(null);
   const [recentWorkspaces, setRecentWorkspaces] = useState<Workspace[]>([]);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [customPath, setCustomPath] = useState('');
   const [homeDir, setHomeDir] = useState<string | null>(null);
+  const folderImportRef = useRef<HTMLInputElement | null>(null);
 
   const bootedRef = useRef(false);
   const author = useMemo(
@@ -141,6 +154,13 @@ export default function App() {
     const id = crypto.getRandomValues(new Uint32Array(2)).join('-');
     return { id, name: 'You', color: randomColor(id) };
   }, []);
+
+  const sidePanelFallback = (
+    <div className="panel side-panel-loading" role="status" aria-live="polite">
+      <div className="panel-title">Loading panel</div>
+      <div className="muted">Resolving module...</div>
+    </div>
+  );
 
   // --- boot ---
   useEffect(() => {
@@ -161,31 +181,76 @@ export default function App() {
       // Restore workspace state.
       const recent = (await kvGet<Workspace[]>('recent.workspaces')) || [];
       setRecentWorkspaces(recent);
+      const openDefaultWorkspace = async (): Promise<boolean> => {
+        try {
+          const result = await localDefaultWorkspace();
+          if (!result.workspace) return false;
+          const ws: Workspace = {
+            type: 'local',
+            path: result.workspace.path,
+            name: result.workspace.name,
+          };
+          setLocalRoot(ws.path);
+          setWorkspace(ws);
+          setRecentWorkspaces((prev) => {
+            const filtered = prev.filter((w) => !(w.path === ws.path && w.type === ws.type));
+            return [ws, ...filtered].slice(0, 20);
+          });
+          await kvSet('last.workspace', ws);
+          return true;
+        } catch {
+          return false;
+        }
+      };
       const lastWs = await kvGet<Workspace>('last.workspace');
       if (lastWs) {
         if (lastWs.type === 'local') {
           try {
             await localWorkspaceInfo(lastWs.path);
             setLocalRoot(lastWs.path);
+            setBrowserWorkspace(null);
             setWorkspace(lastWs);
           } catch {
             // Folder gone — fall through to virtual FS default.
+            if (!(await openDefaultWorkspace())) {
+              const fallback = (await kvGet<string>('last.projectDir')) || sample;
+              setProjectDir((await exists(fallback)) ? fallback : sample);
+            }
+          }
+        } else if (lastWs.type === 'browser-folder' && lastWs.id) {
+          const restored = await restoreDirectory(lastWs.id);
+          if (restored) {
+            const ws: Workspace = {
+              type: 'browser-folder',
+              id: restored.id,
+              path: restored.path,
+              name: restored.name,
+            };
+            setBrowserWorkspace(restored);
+            setLocalRoot(null);
+            setWorkspace(ws);
+          } else if (!(await openDefaultWorkspace())) {
             const fallback = (await kvGet<string>('last.projectDir')) || sample;
             setProjectDir((await exists(fallback)) ? fallback : sample);
           }
         } else {
           if (await exists(lastWs.path)) {
             setProjectDir(lastWs.path);
+            setBrowserWorkspace(null);
             setWorkspace(lastWs);
           } else {
-            const fallback = (await kvGet<string>('last.projectDir')) || sample;
-            setProjectDir((await exists(fallback)) ? fallback : sample);
+            if (!(await openDefaultWorkspace())) {
+              const fallback = (await kvGet<string>('last.projectDir')) || sample;
+              setProjectDir((await exists(fallback)) ? fallback : sample);
+            }
           }
         }
       } else {
         // Legacy: restore from projectDir key.
-        const lastDir = (await kvGet<string>('last.projectDir')) || sample;
-        setProjectDir((await exists(lastDir)) ? lastDir : sample);
+        if (!(await openDefaultWorkspace())) {
+          const lastDir = (await kvGet<string>('last.projectDir')) || sample;
+          setProjectDir((await exists(lastDir)) ? lastDir : sample);
+        }
       }
 
       const savedThemeId = (await kvGet<string>('theme.id')) || 'dark';
@@ -233,10 +298,17 @@ export default function App() {
     [localRoot],
   );
 
+  const isBrowserFile = useCallback(
+    (p: string) => !!browserWorkspace && parseBrowserPath(p)?.id === browserWorkspace.id,
+    [browserWorkspace],
+  );
+
   const openPath = useCallback(
     async (path: string, line?: number) => {
       let text: string;
-      if (isLocalFile(path)) {
+      if (browserWorkspace && isBrowserFile(path)) {
+        text = await readBrowserFile(browserWorkspace, path);
+      } else if (isLocalFile(path)) {
         text = await localRead(path);
       } else {
         if (!(await exists(path))) return;
@@ -259,7 +331,7 @@ export default function App() {
       }
       ext.host.emit('fileOpened', { path });
     },
-    [isLocalFile],
+    [browserWorkspace, isBrowserFile, isLocalFile],
   );
 
   const closeTab = useCallback(
@@ -278,14 +350,16 @@ export default function App() {
     return p;
   }
 
-  const openWorkspace = useCallback((type: 'virtual' | 'local', path: string) => {
+  const openWorkspace = useCallback((type: Exclude<WorkspaceType, 'browser-folder'>, path: string) => {
     const name = path.split('/').pop() || path;
     const ws: Workspace = { type, path, name };
     setWorkspace(ws);
     if (type === 'local') {
       setLocalRoot(path);
+      setBrowserWorkspace(null);
     } else {
       setLocalRoot(null);
+      setBrowserWorkspace(null);
       setProjectDir(path);
     }
     setTabs([]);
@@ -296,9 +370,85 @@ export default function App() {
     });
   }, []);
 
+  async function openStoredWorkspace(ws: Workspace): Promise<void> {
+    if (ws.type === 'browser-folder') {
+      if (!ws.id) {
+        setNotification('Cannot restore browser folder: missing handle id.');
+        return;
+      }
+      const restored = await restoreDirectory(ws.id);
+      if (!restored) {
+        setNotification('Browser folder permission expired. Select the folder again.');
+        setRecentWorkspaces((prev) => prev.filter((item) => workspaceKey(item) !== workspaceKey(ws)));
+        return;
+      }
+      const next: Workspace = {
+        type: 'browser-folder',
+        id: restored.id,
+        path: restored.path,
+        name: restored.name,
+      };
+      setBrowserWorkspace(restored);
+      setWorkspace(next);
+      setLocalRoot(null);
+      setTabs([]);
+      setActive(undefined);
+      setRecentWorkspaces((prev) => [next, ...prev.filter((item) => workspaceKey(item) !== workspaceKey(next))].slice(0, 20));
+      return;
+    }
+    openWorkspace(ws.type, ws.path);
+  }
+
+  async function openBrowserFolder() {
+    setFolderPickerOpen(false);
+    if (!isNativeAvailable()) {
+      if (isWebkitFallback()) folderImportRef.current?.click();
+      else setNotification('This browser cannot select folders. Use a host path instead.');
+      return;
+    }
+    const picked = await pickDirectory();
+    if (!picked) return;
+    const ws: Workspace = {
+      type: 'browser-folder',
+      path: picked.path,
+      name: picked.name,
+      id: picked.id,
+    };
+    setBrowserWorkspace(picked);
+    setWorkspace(ws);
+    setLocalRoot(null);
+    setTabs([]);
+    setActive(undefined);
+    setRecentWorkspaces((prev) => {
+      const filtered = prev.filter((w) => workspaceKey(w) !== workspaceKey(ws));
+      return [ws, ...filtered].slice(0, 20);
+    });
+    setNotification(`Opened browser folder: ${picked.name}`);
+  }
+
+  async function handleFolderImport(e: ChangeEvent<HTMLInputElement>): Promise<void> {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    const first = files[0] as File & { webkitRelativePath?: string };
+    const firstPath = first.webkitRelativePath || first.name;
+    const rootName = (firstPath.split('/')[0] || `folder-import-${Date.now()}`).replace(/[^\w.-]+/g, '-');
+    let dest = join(ROOT, rootName);
+    if (await exists(dest)) dest = join(ROOT, `${rootName}-${Date.now()}`);
+    for (const file of files as Array<File & { webkitRelativePath?: string }>) {
+      const rel = file.webkitRelativePath ? file.webkitRelativePath.split('/').slice(1).join('/') : file.name;
+      if (!rel) continue;
+      await writeBytes(join(dest, rel), new Uint8Array(await file.arrayBuffer()));
+    }
+    e.target.value = '';
+    setFolderPickerOpen(false);
+    openWorkspace('virtual', dest);
+    setNotification(`Imported folder copy: ${rootName}`);
+  }
+
   const closeWorkspace = useCallback(() => {
     setWorkspace(null);
     setLocalRoot(null);
+    setBrowserWorkspace(null);
     const sample = join(ROOT, 'sample');
     setProjectDir(sample);
     setTabs([]);
@@ -352,20 +502,24 @@ export default function App() {
 
   const onIncomingDoc = useCallback(
     async (path: string, text: string) => {
-      if (await exists(path)) {
+      if (browserWorkspace && isBrowserFile(path)) {
+        await writeBrowserFile(browserWorkspace, path, text);
+      } else if (await exists(path)) {
         await writeText(path, text);
       }
       setDocs((d) => ({ ...d, [path]: text }));
       if (active === path) editorRef.current?.setDoc(text);
       setTree((k) => k + 1);
     },
-    [active],
+    [active, browserWorkspace, isBrowserFile],
   );
 
   // Shared write routing used by both explicit save and autosave.
   const persistFile = useCallback(
     async (path: string, text: string): Promise<void> => {
-      if (isLocalFile(path)) {
+      if (browserWorkspace && isBrowserFile(path)) {
+        await writeBrowserFile(browserWorkspace, path, text);
+      } else if (isLocalFile(path)) {
         await localWrite(path, text); // may throw on permission/path errors
       } else {
         await writeText(path, text); // virtual FS — effectively never throws
@@ -373,7 +527,7 @@ export default function App() {
       setTabs((t) => t.map((x) => (x.path === path ? { ...x, dirty: false } : x)));
       ext.host.emit('fileSaved', { path });
     },
-    [isLocalFile],
+    [browserWorkspace, isBrowserFile, isLocalFile],
   );
 
   async function saveActive(): Promise<void> {
@@ -568,9 +722,17 @@ export default function App() {
   const projectRel = projectDir.replace(ROOT + '/', '');
   const crumbs = projectRel.split('/').filter(Boolean);
   const crumbClass = (i: number) => ['crumb-a', 'crumb-b', 'crumb-c'][i % 3];
+  const browserRoot = browserWorkspace ? browserRootPath(browserWorkspace.id) : null;
+  const sourceProjectDir = browserRoot || localRoot || projectDir;
+  const shellProjectDir = localRoot || projectDir;
   const workspaceLabel = workspace
     ? (workspace.type === 'local' ? workspace.name : workspace.path.split('/').pop() || workspace.path)
     : null;
+  const activeDisplayPath = active
+    ? browserRoot && isBrowserPath(active)
+      ? active.replace(browserRoot + '/', '~/').replace(browserRoot, '~/')
+      : active.replace((localRoot || projectDir) + '/', '').replace(ROOT + '/', '~/')
+    : '—';
 
   if (cockpitMode) {
     return (
@@ -586,7 +748,7 @@ export default function App() {
   }
 
   return (
-    <div className="ide" data-theme={theme.id}>
+    <div className="ide" data-theme={theme.id} data-vertical={ideVertical}>
       {/* top bar */}
       <header className="topbar">
         <button
@@ -658,7 +820,7 @@ export default function App() {
         </button>
       </header>
 
-      <div className="workbench">
+      <div className="workbench" data-activity={activity}>
         {/* activity bar */}
         <nav className="activity-bar">
           {activityItems.map((it) => (
@@ -679,79 +841,82 @@ export default function App() {
 
         {/* side panel — each activity wrapped in its own boundary so
             a crash in one panel can't take down the IDE. */}
-        <aside className={'side-panel ' + (sideOpen ? 'open' : 'closed')}>
+        <aside className={'side-panel ' + (sideOpen ? 'open' : 'closed')} data-activity={activity}>
           <ErrorBoundary label={'Side panel: ' + activity} resetKey={activity}>
             <Crasher scope="side" />
-            {activity === 'files' && (
-              <FileExplorer
-                root={projectDir}
-                activePath={active}
-                onOpen={openPath}
-                onChange={() => setTree((k) => k + 1)}
-                refreshKey={tree}
-                localRoot={localRoot}
-                onLocalRootChange={(path) => {
-                  if (path) {
-                    openWorkspace('local', path);
-                  } else {
-                    closeWorkspace();
-                  }
-                }}
-              />
-            )}
-            {activity === 'search' && (
-              <SearchPanel projectDir={projectDir} onOpen={(p, l) => openPath(p, l)} />
-            )}
-            {activity === 'git' && (
-              <GitPanel
-                projectDir={projectDir}
-                onProjectChanged={setProjectDir}
-                onRefresh={() => setTree((k) => k + 1)}
-                author={author}
-              />
-            )}
-            {activity === 'debug' && (
-              <DebugPanel
-                activePath={active}
-                getActiveSource={() => editorRef.current?.getDoc() ?? ''}
-                breakpoints={breakpoints}
-                onToggleBreakpoint={toggleBreakpoint}
-              />
-            )}
-            {activity === 'drive' && (
-              <DrivePanel
-                projectDir={projectDir}
-                activePath={active}
-                onRefresh={() => setTree((k) => k + 1)}
-              />
-            )}
-            {activity === 'ext' && <ExtensionsPanel onRefreshCommands={refreshCommands} />}
-            {activity === 'projects' && (
-              <ProjectsPanel
-                projectDir={projectDir}
-                onOpen={(dir) => openWorkspace('virtual', dir)}
-                onOpenLocalFolder={() => setFolderPickerOpen(true)}
-                recentWorkspaces={recentWorkspaces}
-                onOpenWorkspace={(ws) => openWorkspace(ws.type, ws.path)}
-                onRemoveWorkspace={removeRecentWorkspace}
-              />
-            )}
-            {activity === 'collab' && (
-              <CollabPanel
-                projectDir={projectDir}
-                me={me}
-                onDocIncoming={onIncomingDoc}
-                onCursor={() => {}}
-                bindOut={(c) => (collabRef.current = c)}
-              />
-            )}
-            {activity === 'ai' && (
-              <AIChatPanel
-                projectDir={projectDir}
-                openFiles={tabs.map((t) => t.path)}
-                onFileChanged={() => setTree((k) => k + 1)}
-              />
-            )}
+            <Suspense fallback={sidePanelFallback}>
+              {activity === 'files' && (
+                <FileExplorer
+                  root={projectDir}
+                  activePath={active}
+                  onOpen={openPath}
+                  onChange={() => setTree((k) => k + 1)}
+                  refreshKey={tree}
+                  localRoot={localRoot}
+                  browserWorkspace={browserWorkspace}
+                  onLocalRootChange={(path) => {
+                    if (path) {
+                      openWorkspace('local', path);
+                    } else {
+                      closeWorkspace();
+                    }
+                  }}
+                />
+              )}
+              {activity === 'search' && (
+                <SearchPanel projectDir={projectDir} onOpen={(p, l) => openPath(p, l)} />
+              )}
+              {activity === 'git' && (
+                <GitPanel
+                  projectDir={sourceProjectDir}
+                  onProjectChanged={setProjectDir}
+                  onRefresh={() => setTree((k) => k + 1)}
+                  author={author}
+                />
+              )}
+              {activity === 'debug' && (
+                <DebugPanel
+                  activePath={active}
+                  getActiveSource={() => editorRef.current?.getDoc() ?? ''}
+                  breakpoints={breakpoints}
+                  onToggleBreakpoint={toggleBreakpoint}
+                />
+              )}
+              {activity === 'drive' && (
+                <DrivePanel
+                  projectDir={projectDir}
+                  activePath={active}
+                  onRefresh={() => setTree((k) => k + 1)}
+                />
+              )}
+              {activity === 'ext' && <ExtensionsPanel onRefreshCommands={refreshCommands} />}
+              {activity === 'projects' && (
+                <ProjectsPanel
+                  projectDir={projectDir}
+                  onOpen={(dir) => openWorkspace('virtual', dir)}
+                  onOpenLocalFolder={() => setFolderPickerOpen(true)}
+                  recentWorkspaces={recentWorkspaces}
+                  onOpenWorkspace={openStoredWorkspace}
+                  onRemoveWorkspace={removeRecentWorkspace}
+                />
+              )}
+              {activity === 'collab' && (
+                <CollabPanel
+                  projectDir={projectDir}
+                  me={me}
+                  onDocIncoming={onIncomingDoc}
+                  onCursor={() => {}}
+                  bindOut={(c) => (collabRef.current = c)}
+                />
+              )}
+              {activity === 'ai' && (
+                <AIChatPanel
+                  projectDir={projectDir}
+                  openFiles={tabs.map((t) => t.path)}
+                  onFileChanged={() => setTree((k) => k + 1)}
+                />
+              )}
+            </Suspense>
           </ErrorBoundary>
         </aside>
 
@@ -813,12 +978,12 @@ export default function App() {
                     <h3>Recent</h3>
                     {recentWorkspaces.slice(0, 8).map((ws) => (
                       <button
-                        key={ws.type + ':' + ws.path}
+                        key={workspaceKey(ws)}
                         className="welcome-recent-item"
-                        onClick={() => openWorkspace(ws.type, ws.path)}
+                        onClick={() => openStoredWorkspace(ws)}
                       >
                         <span className="welcome-recent-name">
-                          <Glyph name={ws.type === 'local' ? 'folder_open' : 'files'} /> {ws.name}
+                          <Glyph name={ws.type === 'virtual' ? 'files' : 'folder_open'} /> {ws.name}
                         </span>
                         <span className="welcome-recent-path">{ws.path}</span>
                       </button>
@@ -843,7 +1008,7 @@ export default function App() {
             <span className="st-branch" title="Brand"><Glyph name="bolt" /> MWIDE</span>
             <span className="st-path" title={active || 'no file'}>
               <span className="st-key">FILE</span>
-              {active ? active.replace(projectDir + '/', '').replace(ROOT + '/', '~/') : '—'}
+              {activeDisplayPath}
             </span>
             <span className="spacer" />
             <span className="st-pos"><span className="st-key">POS</span>{String(cursor.line).padStart(3, ' ')}:{String(cursor.col).padStart(3, ' ')}</span>
@@ -883,7 +1048,7 @@ export default function App() {
             <ErrorBoundary label={'Bottom: ' + bottomTab} resetKey={bottomTab}>
               <Crasher scope="bottom" />
               {bottomTab === 'terminal' && (
-                <Terminal projectDir={projectDir} author={author} />
+                <Terminal projectDir={shellProjectDir} author={author} />
               )}
               {bottomTab === 'debug' && (
                 <DebugPanel
@@ -916,8 +1081,28 @@ export default function App() {
                 <Glyph name="close" />
               </button>
             </div>
+            <input
+              ref={(node) => {
+                folderImportRef.current = node;
+                node?.setAttribute('webkitdirectory', '');
+                node?.setAttribute('directory', '');
+              }}
+              type="file"
+              multiple
+              hidden
+              onChange={handleFolderImport}
+            />
             <div className="fp-section">
-              <div className="fp-section-title">Quick Access</div>
+              <div className="fp-section-title">Browser Folder</div>
+              <button className="fp-item" onClick={openBrowserFolder}>
+                <span className="fp-item-label">
+                  <Glyph name="folder_open" /> {isNativeAvailable() ? 'Select Folder' : 'Import Folder Copy'}
+                </span>
+                <span className="fp-item-path">{isNativeAvailable() ? 'Direct browser workspace' : 'Fallback virtual copy'}</span>
+              </button>
+            </div>
+            <div className="fp-section">
+              <div className="fp-section-title">Open Host Path</div>
               {QUICK_LOCATIONS.map((loc) => (
                 <button
                   key={loc.path}
@@ -947,15 +1132,15 @@ export default function App() {
                 <div className="fp-section-title">Recent</div>
                 {recentWorkspaces.slice(0, 10).map((ws) => (
                   <button
-                    key={ws.type + ':' + ws.path}
+                    key={workspaceKey(ws)}
                     className="fp-item"
                     onClick={() => {
                       setFolderPickerOpen(false);
-                      openWorkspace(ws.type, ws.path);
+                      openStoredWorkspace(ws);
                     }}
                   >
                     <span className="fp-item-label">
-                      <Glyph name={ws.type === 'local' ? 'folder_open' : 'files'} /> {ws.name}
+                      <Glyph name={ws.type === 'virtual' ? 'files' : 'folder_open'} /> {ws.name}
                     </span>
                     <span className="fp-item-path">{ws.path}</span>
                   </button>

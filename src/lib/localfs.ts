@@ -122,8 +122,42 @@ export type WorkspaceInfo = {
   childCount: number;
 };
 
+export type DefaultWorkspaceResult = {
+  workspace: WorkspaceInfo | null;
+};
+
+export type LocalGitStatus = {
+  repoId: string;
+  path: string;
+  exists: boolean;
+  branch: string | null;
+  clean: boolean;
+  ahead: number;
+  behind: number;
+  changedFiles: Array<{ path: string; status: string }>;
+  lastCommit: { sha: string; subject: string; author: string; date: string } | null;
+};
+
 export async function localWorkspaceInfo(dirPath: string): Promise<WorkspaceInfo> {
   const r = await fetch(`/api/fs/workspace-info?path=${encodeURIComponent(dirPath)}`);
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(formatErr(t));
+  }
+  return r.json();
+}
+
+export async function localDefaultWorkspace(): Promise<DefaultWorkspaceResult> {
+  const r = await fetch('/api/fs/default-workspace');
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(formatErr(t));
+  }
+  return r.json();
+}
+
+export async function localGitStatus(dirPath: string): Promise<LocalGitStatus> {
+  const r = await fetch(`/api/fs/git-status?path=${encodeURIComponent(dirPath)}`);
   if (!r.ok) {
     const t = await r.text();
     throw new Error(formatErr(t));

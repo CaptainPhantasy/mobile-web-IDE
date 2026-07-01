@@ -1,6 +1,6 @@
 // File tree viewer + actions (new file, new folder, rename, delete,
-// open local folder). Supports both the virtual FS and the real local
-// filesystem via the server bridge.
+// open local folder). Supports virtual FS, server-bridged local FS,
+// and browser-selected folders through the File System Access API.
 
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -23,6 +23,16 @@ import {
   localRemove,
   QUICK_LOCATIONS,
 } from '../lib/localfs';
+import {
+  BrowserWorkspace,
+  browserPath,
+  browserRootPath,
+  listBrowserDir,
+  mkdirBrowserDir,
+  removeBrowserPath,
+  renameBrowserPath,
+  writeBrowserFile,
+} from '../lib/browserfs';
 import { Glyph } from './Glyph';
 import { glyphForFile, colorForFile } from '../lib/glyphs';
 
@@ -36,6 +46,7 @@ type Props = {
   refreshKey: number;
   /** If set, browsing is backed by the real local FS via the server bridge */
   localRoot?: string | null;
+  browserWorkspace?: BrowserWorkspace | null;
   onLocalRootChange?: (path: string | null) => void;
 };
 
@@ -52,6 +63,7 @@ export default function FileExplorer({
   onChange,
   refreshKey,
   localRoot,
+  browserWorkspace,
   onLocalRootChange,
 }: Props) {
   const [tree, setTree] = useState<FsNode | null>(null);
@@ -61,12 +73,13 @@ export default function FileExplorer({
   const [dirMeta, setDirMeta] = useState<Record<string, DirMeta>>({});
   const [pickerOpen, setPickerOpen] = useState(false);
 
-  const isLocal = !!localRoot;
-  const effectiveRoot = localRoot || root;
+  const isBrowser = !!browserWorkspace;
+  const isLocal = !!localRoot && !isBrowser;
+  const effectiveRoot = browserWorkspace ? browserRootPath(browserWorkspace.id) : localRoot || root;
 
   // ── Load virtual FS tree ──
   useEffect(() => {
-    if (isLocal) return;
+    if (isLocal || isBrowser) return;
     let cancelled = false;
     setErr(null);
     exists(root).then((ok) => {
@@ -84,7 +97,7 @@ export default function FileExplorer({
         .catch((e) => setErr(e.message));
     });
     return () => { cancelled = true; };
-  }, [root, refreshKey, isLocal]);
+  }, [root, refreshKey, isLocal, isBrowser]);
 
   // ── Load local FS listing ──
   useEffect(() => {
@@ -109,11 +122,35 @@ export default function FileExplorer({
     return () => { cancelled = true; };
   }, [localRoot, refreshKey, isLocal]);
 
+  // ── Load browser folder root listing ──
+  useEffect(() => {
+    if (!isBrowser || !browserWorkspace) return;
+    let cancelled = false;
+    setErr(null);
+    const rootPath = browserRootPath(browserWorkspace.id);
+    listBrowserDir(browserWorkspace, rootPath)
+      .then((result) => {
+        if (!cancelled) {
+          setLocalItems(result.items);
+          setDirMeta((prev) => ({
+            ...prev,
+            [rootPath]: {
+              total: result.total,
+              truncated: false,
+            },
+          }));
+          setExpanded((prev) => new Set([...prev, rootPath]));
+        }
+      })
+      .catch((e) => setErr(e.message));
+    return () => { cancelled = true; };
+  }, [browserWorkspace, refreshKey, isBrowser]);
+
   // ── Load expanded local dirs ──
   const [localDirCache, setLocalDirCache] = useState<Record<string, TreeNode[]>>({});
 
   useEffect(() => {
-    if (!isLocal) return;
+    if (!isLocal && !isBrowser) return;
     // Only expand paths under the current local root — otherwise stale
     // entries from the virtual FS (e.g. "/projects/sample") leak into
     // the loader and trigger "Path not allowed" noise.
@@ -127,8 +164,16 @@ export default function FileExplorer({
     let cancelled = false;
     Promise.all(
       dirsToLoad.map((d) =>
-        localList(d)
-          .then((r) => ({ path: d, items: r.items, total: r.total, truncated: r.truncated, ok: true as const }))
+        (isBrowser && browserWorkspace
+          ? listBrowserDir(browserWorkspace, d)
+          : localList(d))
+          .then((r) => ({
+            path: d,
+            items: r.items,
+            total: r.total,
+            truncated: 'truncated' in r ? r.truncated : false,
+            ok: true as const,
+          }))
           .catch((e) => ({ path: d, items: [] as TreeNode[], total: 0, truncated: false, ok: false as const, error: e?.message })),
       ),
     ).then((results) => {
@@ -154,7 +199,7 @@ export default function FileExplorer({
       }
     });
     return () => { cancelled = true; };
-  }, [expanded, isLocal, effectiveRoot, localDirCache]);
+  }, [expanded, isLocal, isBrowser, browserWorkspace, effectiveRoot, localDirCache]);
 
   function toggle(path: string) {
     setExpanded((prev) => {
@@ -169,7 +214,7 @@ export default function FileExplorer({
   const rows = useMemo(() => {
     const out: Array<{ node: TreeNode; depth: number }> = [];
 
-    if (isLocal) {
+    if (isLocal || isBrowser) {
       function walkLocal(dirPath: string, depth: number) {
         const items =
           dirPath === effectiveRoot
@@ -194,14 +239,16 @@ export default function FileExplorer({
     }
 
     return out;
-  }, [tree, localItems, localDirCache, expanded, isLocal, effectiveRoot]);
+  }, [tree, localItems, localDirCache, expanded, isLocal, isBrowser, effectiveRoot]);
 
   // ── Actions ──
   async function createFile() {
     const name = prompt('New file name:');
     if (!name) return;
-    const fullPath = join(effectiveRoot, name);
-    if (isLocal) {
+    const fullPath = isBrowser && browserWorkspace ? browserPath(browserWorkspace.id, name) : join(effectiveRoot, name);
+    if (isBrowser && browserWorkspace) {
+      await writeBrowserFile(browserWorkspace, fullPath, '');
+    } else if (isLocal) {
       await localWrite(fullPath, '');
     } else {
       await writeText(fullPath, '');
@@ -212,8 +259,10 @@ export default function FileExplorer({
   async function createFolder() {
     const name = prompt('New folder name:');
     if (!name) return;
-    const fullPath = join(effectiveRoot, name);
-    if (isLocal) {
+    const fullPath = isBrowser && browserWorkspace ? browserPath(browserWorkspace.id, name) : join(effectiveRoot, name);
+    if (isBrowser && browserWorkspace) {
+      await mkdirBrowserDir(browserWorkspace, fullPath);
+    } else if (isLocal) {
       await localMkdir(fullPath);
     } else {
       await mkdirp(fullPath);
@@ -225,10 +274,17 @@ export default function FileExplorer({
     const next = prompt('Rename to:', basename(path));
     if (!next || next === basename(path)) return;
     const parent = path.slice(0, path.lastIndexOf('/'));
-    const dest = join(parent, next);
-    if (isLocal) {
+    if (isBrowser && browserWorkspace) {
+      const rootPath = browserRootPath(browserWorkspace.id);
+      const rel = path.replace(rootPath, '').replace(/^\/+/g, '');
+      const relParent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+      const dest = browserPath(browserWorkspace.id, [relParent, next].filter(Boolean).join('/'));
+      await renameBrowserPath(browserWorkspace, path, dest);
+    } else if (isLocal) {
+      const dest = join(parent, next);
       await localRename(path, dest);
     } else {
+      const dest = join(parent, next);
       await rename(path, dest);
     }
     onChange();
@@ -236,7 +292,9 @@ export default function FileExplorer({
 
   async function handleDelete(path: string) {
     if (!confirm('Delete ' + path + '?')) return;
-    if (isLocal) {
+    if (isBrowser && browserWorkspace) {
+      await removeBrowserPath(browserWorkspace, path);
+    } else if (isLocal) {
       await localRemove(path);
     } else {
       await remove(path);
@@ -284,13 +342,13 @@ export default function FileExplorer({
     if (onLocalRootChange) onLocalRootChange(null);
   }
 
-  const rootMeta = isLocal && localRoot ? dirMeta[localRoot] : undefined;
+  const rootMeta = (isLocal || isBrowser) ? dirMeta[effectiveRoot] : undefined;
 
   return (
     <div className="panel file-explorer">
       <div className="panel-header">
         <div className="panel-title">
-          {isLocal ? 'LOCAL FS' : 'FILES'}
+          {isBrowser ? 'BROWSER FS' : isLocal ? 'LOCAL FS' : 'FILES'}
           {rootMeta && (
             <span className="panel-count" title={rootMeta.truncated ? 'List truncated — showing first N of total' : 'entries'}>
               {rootMeta.total}{rootMeta.truncated ? '+' : ''}
@@ -311,7 +369,7 @@ export default function FileExplorer({
           >
             <Glyph name="folder_open" />
           </button>
-          {isLocal && (
+          {(isLocal || isBrowser) && (
             <button
               className="icon-btn"
               title="Back to virtual FS"
@@ -345,13 +403,13 @@ export default function FileExplorer({
       )}
 
       {/* Local root path display */}
-      {isLocal && (
+      {(isLocal || isBrowser) && (
         <div
           className="local-root-bar"
           onClick={handleOpenLocalFolder}
           title="Click to change folder"
         >
-          <span className="local-root-path">{localRoot}</span>
+          <span className="local-root-path">{browserWorkspace?.name || localRoot}</span>
         </div>
       )}
 

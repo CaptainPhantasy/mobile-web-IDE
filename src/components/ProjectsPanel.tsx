@@ -16,12 +16,7 @@ import {
   exists,
 } from '../lib/fs';
 import { Glyph } from './Glyph';
-
-type Workspace = {
-  type: 'virtual' | 'local';
-  path: string;
-  name: string;
-};
+import { Workspace, workspaceKey } from '../lib/workspace';
 
 type Props = {
   projectDir: string;
@@ -129,13 +124,13 @@ export default function ProjectsPanel({
           {recentWorkspaces.length > 0 && (
             <div className="recent-workspaces">
               {recentWorkspaces.slice(0, 8).map((ws) => (
-                <div key={ws.type + ':' + ws.path} className="recent-ws-row">
+                <div key={workspaceKey(ws)} className="recent-ws-row">
                   <button
                     className="recent-ws-btn"
                     onClick={() => onOpenWorkspace?.(ws)}
                     title={ws.path}
                   >
-                    <Glyph name={ws.type === 'local' ? 'folder_open' : 'files'} />
+                    <Glyph name={ws.type === 'virtual' ? 'files' : 'folder_open'} />
                     <span className="recent-ws-name">{ws.name}</span>
                   </button>
                   <button

@@ -8,27 +8,63 @@ export type VerticalChoice = DeviceClass | 'auto';
 const OVERRIDE_KEY = 'mwide:cockpit:vertical';
 const OVERRIDE_EVENT = 'mwide:vertical-change';
 
-export function classifyDevice(win: Window = window): DeviceClass {
+export type DeviceSnapshot = {
+  width: number;
+  height: number;
+  platform: string;
+  userAgent: string;
+  maxTouchPoints: number;
+  finePointer: boolean;
+  coarsePointer: boolean;
+  hover: boolean;
+};
+
+function deviceSnapshot(win: Window): DeviceSnapshot {
   const mm = (q: string): boolean => typeof win.matchMedia === 'function' && win.matchMedia(q).matches;
-  const finePointer = mm('(pointer: fine)');
-  const hover = mm('(hover: hover)');
-  // 1. Fine pointer + hover => desktop, even when touch is also present.
-  if (finePointer && hover) return 'desktop';
-
   const nav = win.navigator;
-  const touchPoints = nav && typeof nav.maxTouchPoints === 'number' ? nav.maxTouchPoints : 0;
-  // 3. iPad shim: iPadOS Safari reports as macOS but exposes touch points.
-  if (touchPoints > 1 && /Mac/.test(nav?.platform ?? '')) return 'tablet';
+  return {
+    width: win.innerWidth || 1024,
+    height: win.innerHeight || 768,
+    platform: nav?.platform ?? '',
+    userAgent: nav?.userAgent ?? '',
+    maxTouchPoints: typeof nav?.maxTouchPoints === 'number' ? nav.maxTouchPoints : 0,
+    finePointer: mm('(pointer: fine)'),
+    coarsePointer: mm('(pointer: coarse)'),
+    hover: mm('(hover: hover)'),
+  };
+}
 
-  const minDim = Math.min(win.innerWidth || 1024, win.innerHeight || 768);
-  const touchPrimary = mm('(pointer: coarse)') || touchPoints > 1;
-  // 2. Touch-primary => split by smallest viewport dimension.
+export function classifyDeviceSnapshot(device: DeviceSnapshot): DeviceClass {
+  const minDim = Math.min(device.width || 1024, device.height || 768);
+  const ua = device.userAgent;
+  const platform = device.platform;
+  const isPhone =
+    /\b(iPhone|iPod)\b/i.test(ua) ||
+    /\bAndroid\b/i.test(ua) && /\bMobile\b/i.test(ua);
+  const isTablet =
+    /\biPad\b/i.test(ua) ||
+    /\bAndroid\b/i.test(ua) && !/\bMobile\b/i.test(ua);
+  const isIPadOSMacShim = device.maxTouchPoints > 1 && /Mac/.test(platform);
+
+  // Mobile browser descriptors can expose desktop-like pointer media in automation.
+  if (isPhone) return 'mobile';
+
+  // iPadOS Safari reports a Mac platform. Keep it tablet unless split view is phone narrow.
+  if (isTablet || isIPadOSMacShim) return minDim < 600 ? 'mobile' : 'tablet';
+
+  // Fine pointer + hover is the desktop signal for real desktops and touch laptops.
+  if (device.finePointer && device.hover) return 'desktop';
+
+  const touchPrimary = device.coarsePointer || device.maxTouchPoints > 1;
   if (touchPrimary) return minDim < 600 ? 'mobile' : 'tablet';
 
-  // 4. Width fallback.
   if (minDim < 600) return 'mobile';
   if (minDim < 1024) return 'tablet';
   return 'desktop';
+}
+
+export function classifyDevice(win: Window = window): DeviceClass {
+  return classifyDeviceSnapshot(deviceSnapshot(win));
 }
 
 export function getOverride(): VerticalChoice {

@@ -10,7 +10,7 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "start": "tsx server.ts",
-    "test:cockpit": "node --import tsx --test server/cockpit/*.test.ts",
+    "test:cockpit": "node --import tsx --test server/cockpit/*.test.ts src/cockpit/*.test.ts",
     "postinstall": "node -e \"try{require('fs').chmodSync('node_modules/node-pty/prebuilds/'+(process.platform==='darwin'?'darwin-'+process.arch:process.platform+'-'+process.arch)+'/spawn-helper',0o755)}catch{}\""
   },
   "dependencies": {
