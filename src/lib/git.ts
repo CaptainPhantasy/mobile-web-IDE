@@ -66,16 +66,24 @@ export async function remove(dir: string, filepath: string): Promise<void> {
   await git.remove({ fs: rawFs, dir, filepath });
 }
 
+export async function restore(dir: string, filepath: string, opts: { source?: string } = {}): Promise<void> {
+  // isomorphic-git checkout can accept files list, but the API signature in the
+  // version installed here may vary. Use resetIndex to unstage then checkout.
+  await git.checkout({ fs: rawFs, dir, ref: opts.source ?? 'HEAD', filepaths: [filepath] });
+}
+
 export async function commit(
   dir: string,
   message: string,
   author: GitAuthor,
+  opts: { amend?: boolean } = {},
 ): Promise<string> {
   return await git.commit({
     fs: rawFs,
     dir,
     message,
     author: { name: author.name, email: author.email, timestamp: Math.floor(Date.now() / 1000) },
+    amend: opts.amend ?? false,
   });
 }
 
@@ -199,19 +207,21 @@ export async function createBranch(
   dir: string,
   name: string,
   checkoutAfter = true,
+  source?: string,
 ): Promise<void> {
-  await git.branch({ fs: rawFs, dir, ref: name });
-  if (checkoutAfter) {
-    await git.checkout({ fs: rawFs, dir, ref: name });
-  }
+  await git.branch({ fs: rawFs, dir, ref: name, object: source, checkout: checkoutAfter });
 }
 
 export async function deleteBranch(dir: string, name: string): Promise<void> {
   await git.deleteBranch({ fs: rawFs, dir, ref: name });
 }
 
-export async function checkout(dir: string, ref: string): Promise<void> {
-  await git.checkout({ fs: rawFs, dir, ref });
+export async function renameBranch(dir: string, oldName: string, newName: string): Promise<void> {
+  await git.renameBranch({ fs: rawFs, dir, oldref: oldName, ref: newName });
+}
+
+export async function checkout(dir: string, ref: string, opts?: { filepaths?: string[] }): Promise<void> {
+  await git.checkout({ fs: rawFs, dir, ref, ...(opts || {}) });
 }
 
 export async function merge(
@@ -228,6 +238,53 @@ export async function merge(
     author: { name: author.name, email: author.email },
   });
 }
+
+export async function abortMerge(dir: string): Promise<void> {
+  await git.abortMerge({ fs: rawFs, dir });
+}
+
+// -------- Tags --------
+
+export async function listTags(dir: string): Promise<string[]> {
+  return await git.listTags({ fs: rawFs, dir });
+}
+
+export async function createTag(dir: string, ref: string, opts: { message?: string; object?: string; tagger?: GitAuthor } = {}): Promise<void> {
+  if (opts.message && opts.tagger) {
+    await git.annotatedTag({
+      fs: rawFs,
+      dir,
+      ref,
+      object: opts.object || 'HEAD',
+      message: opts.message,
+      tagger: { name: opts.tagger.name, email: opts.tagger.email, timestamp: Math.floor(Date.now() / 1000) },
+    });
+  } else {
+    await git.tag({ fs: rawFs, dir, ref });
+  }
+}
+
+export async function deleteTag(dir: string, ref: string): Promise<void> {
+  await git.deleteTag({ fs: rawFs, dir, ref });
+}
+
+// -------- Stash --------
+
+export async function stash(
+  dir: string,
+  op: 'push' | 'pop' | 'apply' | 'drop' | 'list' | 'clear',
+  opts: { message?: string; refIdx?: number } = {},
+): Promise<void | string> {
+  return (await git.stash({ fs: rawFs, dir, op, message: opts.message, refIdx: opts.refIdx })) as void | string;
+}
+
+// -------- Reset --------
+
+export async function resetIndex(dir: string, filepath?: string): Promise<void> {
+  await git.resetIndex({ fs: rawFs, dir, filepath });
+}
+
+// -------- Config --------
 
 export async function listRemotes(
   dir: string,
@@ -260,6 +317,13 @@ export async function getConfig(
   path: string,
 ): Promise<string | undefined> {
   return (await git.getConfig({ fs: rawFs, dir, path })) || undefined;
+}
+
+export async function getConfigAll(
+  dir: string,
+  path?: string,
+): Promise<Array<{ path: string; value: string; source: string; scope: string }>> {
+  return (await git.getConfigAll({ fs: rawFs, dir, path })) as any;
 }
 
 /** Read both sides of a pending change: the committed HEAD blob for

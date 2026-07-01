@@ -205,7 +205,7 @@ export default function MobileKeybar() {
       className="mobile-keybar"
       role="toolbar"
       aria-label="Mobile developer keys"
-      style={{ bottom }}
+      style={{ bottom: bottom + 48 }}
     >
       {KEYS.map((k, i) => (
         <button

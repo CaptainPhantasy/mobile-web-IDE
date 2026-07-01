@@ -17,6 +17,8 @@ import { kvGet, kvSet } from './kv';
 import { setVaultKey, listVaultIds } from './vault';
 import { readText, writeText, readdir, mkdirp, remove, rename, stat, walk, join, exists, dirname } from './fs';
 import { findInFiles } from './search';
+import * as git from './git';
+import * as gh from './github';
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -289,6 +291,180 @@ export const IDE_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  // ─── Git Tools ─────────────────────────────────────────────────────────────
+  {
+    type: 'function',
+    function: {
+      name: 'git_status',
+      description: 'Get the git working tree status. Returns a list of changed files with their status (new, modified, deleted, staged).',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_diff',
+      description: 'Show the diff for a specific file between HEAD and the working tree.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Relative path of the file to diff' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_stage',
+      description: 'Stage files for commit. Use filepath "all" to stage every change.',
+      parameters: {
+        type: 'object',
+        properties: {
+          filepath: { type: 'string', description: 'Relative path, or "all"' },
+        },
+        required: ['filepath'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_commit',
+      description: 'Commit staged changes with a message.',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'Commit message' },
+        },
+        required: ['message'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_push',
+      description: 'Push the current branch to the default remote (origin).',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_pull',
+      description: 'Pull from the default remote (origin).',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_fetch',
+      description: 'Fetch from the default remote (origin).',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_list_branches',
+      description: 'List all local branches and indicate which one is current.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_create_branch',
+      description: 'Create a new branch and optionally check it out.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Branch name' },
+          checkout: { type: 'boolean', description: 'Switch to the new branch after creating it (default: true)' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_checkout_branch',
+      description: 'Switch to an existing branch.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Branch name' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_log',
+      description: 'Show recent commit history.',
+      parameters: {
+        type: 'object',
+        properties: {
+          depth: { type: 'number', description: 'Number of commits to show (default: 10)' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_list_prs',
+      description: 'List open pull requests for the current GitHub repository.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_create_pr',
+      description: 'Create a new pull request on GitHub.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'PR title' },
+          body: { type: 'string', description: 'PR body (markdown)' },
+          head: { type: 'string', description: 'Head branch name' },
+          base: { type: 'string', description: 'Base branch name (default: main)' },
+        },
+        required: ['title', 'head'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_list_issues',
+      description: 'List open issues for the current GitHub repository.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_create_issue',
+      description: 'Create a new issue on GitHub.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Issue title' },
+          body: { type: 'string', description: 'Issue body (markdown)' },
+        },
+        required: ['title'],
+      },
+    },
+  },
 ];
 
 // ─── Tool Execution ──────────────────────────────────────────────────────
@@ -408,6 +584,185 @@ export async function executeTool(
         };
       }
 
+      // ─── Git Tool Execution ──────────────────────────────────────────────
+
+      case 'git_status': {
+        try {
+          const entries = await git.statusList(projectDir);
+          if (entries.length === 0) return { success: true, content: 'Working tree clean.' };
+          const lines = entries.map((e) => `${e.label}: ${e.path}`);
+          return { success: true, content: lines.join('\n') };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_diff': {
+        try {
+          const diff = await git.diffFile(projectDir, String(args.path || ''));
+          if (diff.length === 0) return { success: true, content: 'No changes.' };
+          const lines = diff.map((d) => `${d.kind}${d.text}`);
+          return { success: true, content: lines.join('\n') };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_stage': {
+        try {
+          const fp = String(args.filepath || '');
+          if (fp === 'all' || fp === '.') {
+            await git.stageAll(projectDir);
+          } else {
+            const entry = (await git.statusList(projectDir)).find((e) => e.path === fp);
+            if (entry?.workdir === 0) await git.remove(projectDir, fp);
+            else await git.add(projectDir, fp);
+          }
+          return { success: true, content: `Staged ${fp}` };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_commit': {
+        try {
+          const name = (await git.getConfig(projectDir, 'user.name')) || 'Mobile IDE User';
+          const email = (await git.getConfig(projectDir, 'user.email')) || 'user@webide.local';
+          const oid = await git.commit(projectDir, String(args.message || ''), { name, email });
+          return { success: true, content: `Committed ${oid.slice(0, 7)}` };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_push': {
+        try {
+          const token = await gh.getToken();
+          const res = await git.push(projectDir, {
+            auth: token ? { username: 'x-access-token', password: token } : undefined,
+          });
+          return { success: true, content: `Push ${res.ok ? 'succeeded' : JSON.stringify(res)}` };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_pull': {
+        try {
+          const token = await gh.getToken();
+          const name = (await git.getConfig(projectDir, 'user.name')) || 'Mobile IDE User';
+          const email = (await git.getConfig(projectDir, 'user.email')) || 'user@webide.local';
+          await git.pull(projectDir, {
+            auth: token ? { username: 'x-access-token', password: token } : undefined,
+            author: { name, email },
+          });
+          return { success: true, content: 'Pull succeeded.' };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_fetch': {
+        try {
+          const token = await gh.getToken();
+          await git.fetch(projectDir, {
+            auth: token ? { username: 'x-access-token', password: token } : undefined,
+          });
+          return { success: true, content: 'Fetch succeeded.' };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_list_branches': {
+        try {
+          const branches = await git.listBranches(projectDir);
+          const current = await git.currentBranch(projectDir);
+          const lines = branches.map((b) => `${b === current ? '*' : ' '} ${b}`);
+          return { success: true, content: lines.join('\n') };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_create_branch': {
+        try {
+          const checkout = args.checkout !== false;
+          await git.createBranch(projectDir, String(args.name || ''), checkout);
+          return { success: true, content: `Created branch ${args.name}${checkout ? ' and checked out' : ''}.` };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_checkout_branch': {
+        try {
+          await git.checkout(projectDir, String(args.name || ''));
+          return { success: true, content: `Switched to ${args.name}.` };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'git_log': {
+        try {
+          const depth = typeof args.depth === 'number' ? args.depth : 10;
+          const log = await git.log(projectDir, { depth });
+          const lines = log.map((c) => `${c.oid.slice(0, 7)} ${c.commit.message.split('\n')[0]} — ${c.commit.author.name}`);
+          return { success: true, content: lines.join('\n') };
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
+      case 'github_list_prs':
+      case 'github_create_pr':
+      case 'github_list_issues':
+      case 'github_create_issue': {
+        try {
+          const remotes = await git.listRemotes(projectDir);
+          const origin = remotes.find((r) => r.remote === 'origin') || remotes[0];
+          const m = origin?.url.match(/github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?$/i);
+          const fullName = m ? `${m[1]}/${m[2]}` : undefined;
+          if (!fullName) return { success: false, content: 'No GitHub remote detected.' };
+
+          if (name === 'github_list_prs') {
+            const prs = await gh.listPullRequests(fullName, { state: 'open' });
+            const lines = prs.map((pr) => `#${pr.number} ${pr.title} (${pr.state}) — ${pr.user?.login}`);
+            return { success: true, content: lines.join('\n') || 'No open PRs.' };
+          }
+
+          if (name === 'github_create_pr') {
+            const current = await git.currentBranch(projectDir);
+            const base = String(args.base || 'main');
+            const head = String(args.head || current || base);
+            const pr = await gh.createPullRequest(fullName, {
+              title: String(args.title || ''),
+              head,
+              base,
+              body: args.body ? String(args.body) : undefined,
+            });
+            return { success: true, content: `Created PR #${pr.number}: ${pr.html_url}` };
+          }
+
+          if (name === 'github_list_issues') {
+            const issues = await gh.listIssues(fullName, { state: 'open' });
+            const lines = issues.map((i) => `#${i.number} ${i.title} (${i.state}) — ${i.user?.login}`);
+            return { success: true, content: lines.join('\n') || 'No open issues.' };
+          }
+
+          if (name === 'github_create_issue') {
+            const issue = await gh.createIssue(fullName, {
+              title: String(args.title || ''),
+              body: args.body ? String(args.body) : undefined,
+            });
+            return { success: true, content: `Created issue #${issue.number}: ${issue.html_url}` };
+          }
+        } catch (e: any) {
+          return { success: false, content: e.message };
+        }
+      }
+
       default:
         return { success: false, content: `Unknown tool: ${name}` };
     }
@@ -522,6 +877,24 @@ You have access to the following tools to read and modify the user's codebase:
 - **rename_path**: Rename/move a file or directory
 - **get_file_info**: Get file/directory metadata
 
+## Git Tools
+You also have access to version control tools:
+- **git_status**: Show changed files in the working tree
+- **git_diff**: Show diff for a specific file
+- **git_stage**: Stage files (use "all" for everything)
+- **git_commit**: Commit staged changes with a message
+- **git_push**: Push current branch to origin
+- **git_pull**: Pull from origin
+- **git_fetch**: Fetch from origin
+- **git_list_branches**: List local branches
+- **git_create_branch**: Create a new branch (optionally checkout)
+- **git_checkout_branch**: Switch to an existing branch
+- **git_log**: Show recent commits
+- **github_list_prs**: List open pull requests
+- **github_create_pr**: Create a new pull request (title, head, base, body)
+- **github_list_issues**: List open issues
+- **github_create_issue**: Create a new issue (title, body)
+
 ## Guidelines
 1. Always read a file before modifying it so you understand the current state.
 2. When writing files, write the COMPLETE file content — never partial or truncated.
@@ -529,7 +902,8 @@ You have access to the following tools to read and modify the user's codebase:
 4. When the user asks you to create something, read relevant existing files first to match the project's style and conventions.
 5. Explain what you're doing before making changes.
 6. If you're unsure about something, ask the user for clarification.
-7. Be concise but thorough. Show code, don't just describe it.`;
+7. Be concise but thorough. Show code, don't just describe it.
+8. For git operations, use the git tools directly rather than describing steps.`;
 }
 
 // ─── SSE Streaming via Server Proxy ──────────────────────────────────────
@@ -684,6 +1058,7 @@ export async function runAgenticLoop(
   openFiles: string[],
   callbacks: AgenticCallbacks,
   debug = false,
+  tools: ToolDefinition[] = IDE_TOOLS,
 ): Promise<ChatMessage[]> {
   const MAX_ITERATIONS = 20;
   const allMessages = [...messages];
@@ -700,7 +1075,7 @@ export async function runAgenticLoop(
     let assistantContent = '';
     const toolCalls: ToolCall[] = [];
 
-    for await (const event of streamChat(provider, allMessages, IDE_TOOLS, debug)) {
+    for await (const event of streamChat(provider, allMessages, tools, debug)) {
       if (event.type === 'token' && event.text) {
         assistantContent += event.text;
         callbacks.onToken(event.text);

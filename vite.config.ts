@@ -72,6 +72,33 @@ export default defineConfig(({ mode }) => {
     define: {
       'process.env.APP_URL': JSON.stringify(env.APP_URL || ''),
     },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (!id.includes('node_modules')) return undefined;
+            if (id.includes('@codemirror') || id.includes('/codemirror/')) return 'codemirror';
+            if (id.includes('@xterm')) return 'xterm';
+            if (id.includes('isomorphic-git') || id.includes('@isomorphic-git') || id.includes('/idb/')) {
+              return 'git-vendor';
+            }
+            if (id.includes('/jszip/') || id.includes('/pako/')) return 'archive-vendor';
+            if (id.includes('/buffer/') || id.includes('/base64-js/') || id.includes('/ieee754/')) {
+              return 'buffer-vendor';
+            }
+            if (id.includes('workbox-window')) return 'pwa-vendor';
+            if (id.includes('/react/') || id.includes('/react-dom/') || id.includes('/scheduler/')) {
+              return 'react-vendor';
+            }
+            const pkg = id.split('node_modules/')[1];
+            if (!pkg) return 'vendor';
+            const segments = pkg.split('/');
+            const name = segments[0].startsWith('@') ? `${segments[0]}-${segments[1]}` : segments[0];
+            return `vendor-${name.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+          },
+        },
+      },
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
