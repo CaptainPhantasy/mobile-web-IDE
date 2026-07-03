@@ -25,3 +25,7 @@ coverage/
 # Cockpit local config + audit (never commit)
 mwide.repos.json
 mwide.audit.log
+
+# Local governance overlays (keep on this machine, not in remote)
+FLOYD.md
+SSOT/mobile-web-IDE_SSOT.md

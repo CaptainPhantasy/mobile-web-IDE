@@ -570,7 +570,10 @@ export default function AIChatPanel({ projectDir, openFiles, onFileChanged }: Pr
         {messages.length === 0 && !streaming && (
           <div className="ai-empty">
             <p>Ask me to read, write, refactor, or explain code.</p>
-            <p className="muted small">Configure a provider with <Glyph name="ext" /> to get started.</p>
+            <p className="muted small">Choose a provider, store its key in the vault, then test the connection before you start.</p>
+            <button className="ai-empty-cta" onClick={() => setShowSettings(true)}>
+              <Glyph name="ext" /> Configure provider
+            </button>
           </div>
         )}
         {messages.map((msg, i) => {

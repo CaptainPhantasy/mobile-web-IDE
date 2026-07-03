@@ -44,7 +44,7 @@ import {
   writeBytes,
   writeText,
 } from './lib/fs';
-import { localDefaultWorkspace, localRead, localWrite, localWorkspaceInfo, QUICK_LOCATIONS } from './lib/localfs';
+import { localDefaultWorkspace, localGitStatus, localRead, localWrite, localWorkspaceInfo, QUICK_LOCATIONS, type LocalGitStatus } from './lib/localfs';
 import { kvGet, kvSet, kvDel } from './lib/kv';
 import {
   BrowserWorkspace,
@@ -60,6 +60,8 @@ import {
 } from './lib/browserfs';
 import { Workspace, WorkspaceType, workspaceKey } from './lib/workspace';
 import { BUILTIN_THEMES, Theme, applyTheme } from './lib/themes';
+import { listVaultIds } from './lib/vault';
+import * as git from './lib/git';
 import * as ext from './lib/extensions';
 import { Breakpoint } from './lib/debugger';
 import { Collab, CollabPeer } from './lib/collab';
@@ -106,6 +108,11 @@ function randomColor(seed: string): string {
   return `hsl(${h % 360}, 70%, 55%)`;
 }
 
+type WorkspaceGitSummary =
+  | { mode: 'browser-folder' }
+  | { mode: 'host'; status: LocalGitStatus | null }
+  | { mode: 'virtual'; branch: string | null; changed: number; isRepo: boolean };
+
 export default function App() {
   const ideVertical = useDeviceClass();
   const [projectDir, setProjectDir] = useState<string>(join(ROOT, 'sample'));
@@ -143,6 +150,9 @@ export default function App() {
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [customPath, setCustomPath] = useState('');
   const [homeDir, setHomeDir] = useState<string | null>(null);
+  const [vaultedProviderIds, setVaultedProviderIds] = useState<Set<string>>(new Set());
+  const [workspaceGitSummary, setWorkspaceGitSummary] = useState<WorkspaceGitSummary | null>(null);
+  const [welcomeDismissed, setWelcomeDismissed] = useState(false);
   const folderImportRef = useRef<HTMLInputElement | null>(null);
 
   const bootedRef = useRef(false);
@@ -281,6 +291,10 @@ export default function App() {
     setActive(undefined);
   }, [projectDir]);
 
+  useEffect(() => {
+    setWelcomeDismissed(false);
+  }, [workspace?.path, workspace?.type, projectDir]);
+
   // Persist workspace + recent list whenever they change.
   useEffect(() => {
     if (!bootedRef.current) return;
@@ -291,6 +305,26 @@ export default function App() {
   useEffect(() => {
     (window as any).__WEBIDE_ACTIVE_PATH = active;
   }, [active]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshVaultState = async (): Promise<void> => {
+      try {
+        const ids = await listVaultIds();
+        if (!cancelled) setVaultedProviderIds(new Set(ids));
+      } catch {
+        if (!cancelled) setVaultedProviderIds(new Set());
+      }
+    };
+    refreshVaultState();
+    window.addEventListener('focus', refreshVaultState);
+    document.addEventListener('visibilitychange', refreshVaultState);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', refreshVaultState);
+      document.removeEventListener('visibilitychange', refreshVaultState);
+    };
+  }, []);
 
   // --- tabs / open ---
   const isLocalFile = useCallback(
@@ -478,6 +512,12 @@ export default function App() {
 
   function removeRecentWorkspace(path: string) {
     setRecentWorkspaces((prev) => prev.filter((w) => w.path !== path));
+  }
+
+  async function openSampleWorkspace(): Promise<void> {
+    const sample = join(ROOT, 'sample');
+    openWorkspace('virtual', sample);
+    setNotification('Opened sample workspace.');
   }
 
   const onChange = useCallback(
@@ -725,6 +765,7 @@ export default function App() {
   const browserRoot = browserWorkspace ? browserRootPath(browserWorkspace.id) : null;
   const sourceProjectDir = browserRoot || localRoot || projectDir;
   const shellProjectDir = localRoot || projectDir;
+  const isSampleWorkspace = !workspace && projectDir === join(ROOT, 'sample');
   const workspaceLabel = workspace
     ? (workspace.type === 'local' ? workspace.name : workspace.path.split('/').pop() || workspace.path)
     : null;
@@ -733,6 +774,113 @@ export default function App() {
       ? active.replace(browserRoot + '/', '~/').replace(browserRoot, '~/')
       : active.replace((localRoot || projectDir) + '/', '').replace(ROOT + '/', '~/')
     : '—';
+  const showWelcomeOverlay = !active && tabs.length === 0 && !welcomeDismissed;
+  const aiReady = vaultedProviderIds.size > 0;
+
+  useEffect(() => {
+    if (showWelcomeOverlay && ideVertical === 'mobile') {
+      setSideOpen(false);
+    }
+  }, [showWelcomeOverlay, ideVertical]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadWorkspaceGitSummary = async (): Promise<void> => {
+      if (browserWorkspace) {
+        if (!cancelled) setWorkspaceGitSummary({ mode: 'browser-folder' });
+        return;
+      }
+      if (localRoot) {
+        try {
+          const status = await localGitStatus(localRoot);
+          if (!cancelled) setWorkspaceGitSummary({ mode: 'host', status });
+        } catch {
+          if (!cancelled) setWorkspaceGitSummary({ mode: 'host', status: null });
+        }
+        return;
+      }
+      try {
+        const [branch, status] = await Promise.all([
+          git.currentBranch(projectDir),
+          git.statusList(projectDir),
+        ]);
+        if (!cancelled) {
+          setWorkspaceGitSummary({
+            mode: 'virtual',
+            branch,
+            changed: status.length,
+            isRepo: true,
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setWorkspaceGitSummary({
+            mode: 'virtual',
+            branch: null,
+            changed: 0,
+            isRepo: false,
+          });
+        }
+      }
+    };
+    loadWorkspaceGitSummary();
+    return () => {
+      cancelled = true;
+    };
+  }, [browserWorkspace, localRoot, projectDir, tree]);
+
+  const workspaceModeLabel = browserWorkspace
+    ? 'Browser folder'
+    : localRoot
+      ? 'Host path'
+      : isSampleWorkspace
+        ? 'Sample workspace'
+        : 'MWIDE workspace';
+  const workspacePathLabel = workspace?.path || projectDir;
+  const workspaceSummary = browserWorkspace
+    ? 'Direct browser editing is active. Git actions are unavailable in this mode.'
+    : localRoot
+      ? 'Real host files are open. The Git panel shows host status, while commit/push should happen in terminal or a cloned MWIDE workspace.'
+      : isSampleWorkspace
+        ? 'You are in the seeded sample project. Use it to explore safely, or switch to a real workspace.'
+        : 'Managed MWIDE workspace. This is the best path for in-app Git workflows after cloning or initializing a repo.';
+  const gitSummary = workspaceGitSummary?.mode === 'browser-folder'
+    ? { state: 'limited', detail: 'Unavailable for browser-selected folders', hint: 'Open the same repo as a host path or clone into MWIDE.' }
+    : workspaceGitSummary?.mode === 'host'
+      ? workspaceGitSummary.status?.branch
+        ? {
+            state: 'status only',
+            detail: `${workspaceGitSummary.status.branch} · ${workspaceGitSummary.status.clean ? 'clean' : `${workspaceGitSummary.status.changedFiles.length} changed`}`,
+            hint: 'Review host status here, then use terminal for write operations.',
+          }
+        : {
+            state: 'no repo',
+            detail: 'Host path is not a Git repository',
+            hint: 'Open a repo, or clone into a managed MWIDE workspace.',
+          }
+      : workspaceGitSummary?.mode === 'virtual'
+        ? workspaceGitSummary.isRepo
+          ? {
+              state: 'ready',
+              detail: `${workspaceGitSummary.branch || '(detached)'} · ${workspaceGitSummary.changed} changed`,
+              hint: 'Branch, stage, commit, and sync are available in the Source panel.',
+            }
+          : {
+              state: 'not initialized',
+              detail: 'No repository yet',
+              hint: 'Initialize Git here or clone a repository into this workspace.',
+            }
+        : {
+            state: 'checking',
+            detail: 'Inspecting workspace',
+            hint: 'Loading capability status…',
+          };
+  const aiSummary = aiReady
+    ? { state: 'ready', detail: `${vaultedProviderIds.size} provider${vaultedProviderIds.size === 1 ? '' : 's'} configured`, hint: 'Open AI and start chatting against the active project.' }
+    : { state: 'setup required', detail: 'No provider key stored', hint: 'Open AI, choose a provider, store a key, and test the connection.' };
+  const runSummary = active
+    ? { state: 'ready', detail: activeDisplayPath, hint: 'Use Run or the bottom terminal/debug panels to execute and inspect code.' }
+    : { state: 'next step', detail: 'Open a file first', hint: 'Pick a file from Files or Recent, then run or edit from there.' };
 
   if (cockpitMode) {
     return (
@@ -872,6 +1020,11 @@ export default function App() {
                   onProjectChanged={setProjectDir}
                   onRefresh={() => setTree((k) => k + 1)}
                   author={author}
+                  onRequestOpenWorkspace={() => setFolderPickerOpen(true)}
+                  onRequestTerminal={() => {
+                    setBottomTab('terminal');
+                    setBottomOpen(true);
+                  }}
                 />
               )}
               {activity === 'debug' && (
@@ -950,6 +1103,151 @@ export default function App() {
             )}
           </div>
           <div className="editor-wrap">
+            {showWelcomeOverlay && (
+              <div className="welcome-shell-overlay">
+                <div className="welcome-shell-card">
+                  <div className="welcome-shell-header">
+                    <div>
+                      <h2>Start in one clear mode</h2>
+                      <p className="tagline">// choose where the project lives, then use only the surfaces that are actually ready there</p>
+                    </div>
+                    <button className="icon-btn" onClick={() => setWelcomeDismissed(true)} title="Dismiss guide">
+                      <Glyph name="close" />
+                    </button>
+                  </div>
+
+                  <div className="welcome-shell-actions">
+                    <button className="welcome-cta welcome-cta-primary" onClick={() => setFolderPickerOpen(true)}>
+                      <Glyph name="folder_open" />
+                      <span>Open workspace</span>
+                      <small>Host path, browser folder, recent, or sample</small>
+                    </button>
+                    <button className="welcome-cta" onClick={openSampleWorkspace}>
+                      <Glyph name="files" />
+                      <span>Use sample</span>
+                      <small>Safe demo workspace with no host-file risk</small>
+                    </button>
+                    <button
+                      className="welcome-cta"
+                      onClick={() => {
+                        setWelcomeDismissed(true);
+                        setActivity('files');
+                        setSideOpen(true);
+                      }}
+                    >
+                      <Glyph name="search" />
+                      <span>Browse files</span>
+                      <small>Open the Files panel and start navigating</small>
+                    </button>
+                  </div>
+
+                  <div className="welcome-shell-grid">
+                    <section className="welcome-panel">
+                      <div className="welcome-panel-title">Workspace</div>
+                      <div className="welcome-state-row">
+                        <span className="welcome-state-pill ready">{workspaceModeLabel}</span>
+                        <code>{workspacePathLabel}</code>
+                      </div>
+                      <p>{workspaceSummary}</p>
+                    </section>
+
+                    <section className="welcome-panel">
+                      <div className="welcome-panel-title">Readiness</div>
+                      <div className="welcome-capability-list">
+                        <button
+                          className="welcome-capability"
+                          onClick={() => {
+                            setWelcomeDismissed(true);
+                            setActivity('git');
+                            setSideOpen(true);
+                          }}
+                        >
+                          <div className="welcome-capability-head">
+                            <span><Glyph name="git" /> Source</span>
+                            <span className={`welcome-state-pill ${gitSummary.state === 'ready' ? 'ready' : gitSummary.state === 'status only' ? 'limited' : 'pending'}`}>{gitSummary.state}</span>
+                          </div>
+                          <strong>{gitSummary.detail}</strong>
+                          <small>{gitSummary.hint}</small>
+                        </button>
+                        <button
+                          className="welcome-capability"
+                          onClick={() => {
+                            setWelcomeDismissed(true);
+                            setActivity('ai');
+                            setSideOpen(true);
+                          }}
+                        >
+                          <div className="welcome-capability-head">
+                            <span><Glyph name="ai" /> AI</span>
+                            <span className={`welcome-state-pill ${aiReady ? 'ready' : 'pending'}`}>{aiSummary.state}</span>
+                          </div>
+                          <strong>{aiSummary.detail}</strong>
+                          <small>{aiSummary.hint}</small>
+                        </button>
+                        <button
+                          className="welcome-capability"
+                          onClick={() => {
+                            setWelcomeDismissed(true);
+                            setActivity('debug');
+                            setBottomTab('terminal');
+                            setBottomOpen(true);
+                          }}
+                        >
+                          <div className="welcome-capability-head">
+                            <span><Glyph name="debug" /> Run</span>
+                            <span className={`welcome-state-pill ${active ? 'ready' : 'pending'}`}>{runSummary.state}</span>
+                          </div>
+                          <strong>{runSummary.detail}</strong>
+                          <small>{runSummary.hint}</small>
+                        </button>
+                      </div>
+                    </section>
+                  </div>
+
+                  <section className="welcome-panel">
+                    <div className="welcome-panel-title">Happy path</div>
+                    <div className="welcome-checklist">
+                      <div className="welcome-checklist-item">
+                        <span className={`welcome-check ${workspace || isSampleWorkspace ? 'done' : ''}`}><Glyph name={(workspace || isSampleWorkspace) ? 'ok' : 'circle'} /></span>
+                        <div><strong>1. Open a workspace</strong><small>Choose host path, browser folder, recent, or sample.</small></div>
+                      </div>
+                      <div className="welcome-checklist-item">
+                        <span className={`welcome-check ${tabs.length > 0 ? 'done' : ''}`}><Glyph name={tabs.length > 0 ? 'ok' : 'circle'} /></span>
+                        <div><strong>2. Open a file</strong><small>Use Files or Recent to get a real document into the editor.</small></div>
+                      </div>
+                      <div className="welcome-checklist-item">
+                        <span className={`welcome-check ${workspaceGitSummary?.mode === 'virtual' && workspaceGitSummary.isRepo ? 'done' : ''}`}><Glyph name={workspaceGitSummary?.mode === 'virtual' && workspaceGitSummary.isRepo ? 'ok' : 'circle'} /></span>
+                        <div><strong>3. Enable source control where it works best</strong><small>In-app Git writes are for managed MWIDE workspaces, not browser folders or host paths.</small></div>
+                      </div>
+                      <div className="welcome-checklist-item">
+                        <span className={`welcome-check ${aiReady ? 'done' : ''}`}><Glyph name={aiReady ? 'ok' : 'circle'} /></span>
+                        <div><strong>4. Configure AI only when needed</strong><small>Store a provider key in the vault, test it, then start chatting.</small></div>
+                      </div>
+                    </div>
+                  </section>
+
+                  {recentWorkspaces.length > 0 && (
+                    <section className="welcome-panel">
+                      <div className="welcome-panel-title">Recent workspaces</div>
+                      <div className="welcome-recent">
+                        {recentWorkspaces.slice(0, 6).map((ws) => (
+                          <button
+                            key={workspaceKey(ws)}
+                            className="welcome-recent-item"
+                            onClick={() => openStoredWorkspace(ws)}
+                          >
+                            <span className="welcome-recent-name">
+                              <Glyph name={ws.type === 'virtual' ? 'files' : 'folder_open'} /> {ws.name}
+                            </span>
+                            <span className="welcome-recent-path">{ws.path}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                </div>
+              </div>
+            )}
             {active ? (
               <ErrorBoundary label="Editor" resetKey={active}>
                 <Crasher scope="editor" />

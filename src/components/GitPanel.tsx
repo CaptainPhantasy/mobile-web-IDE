@@ -18,6 +18,8 @@ type Props = {
   onProjectChanged: (dir: string) => void;
   onRefresh: () => void;
   author: { name: string; email: string };
+  onRequestOpenWorkspace?: () => void;
+  onRequestTerminal?: () => void;
 };
 
 type Tab = 'status' | 'branches' | 'prs' | 'issues' | 'actions' | 'repo' | 'settings';
@@ -72,7 +74,7 @@ function parseGitHubFullName(url?: string): string | undefined {
   return m ? `${m[1]}/${m[2]}` : undefined;
 }
 
-export default function GitPanel({ projectDir, onProjectChanged, onRefresh, author }: Props) {
+export default function GitPanel({ projectDir, onProjectChanged, onRefresh, author, onRequestOpenWorkspace, onRequestTerminal }: Props) {
   const vertical = useDeviceClass();
   const isBrowserWorkspace = projectDir.startsWith('browserfs:');
   const isHostWorkspace = !isBrowserWorkspace && projectDir.startsWith('/') && !projectDir.startsWith(ROOT + '/');
@@ -976,6 +978,10 @@ export default function GitPanel({ projectDir, onProjectChanged, onRefresh, auth
                       })}
                     </div>
                     <div className="muted small">Host workspaces show read-only Git status here; browser Git write actions remain available for virtual/cloned projects.</div>
+                    <div className="row">
+                      <button onClick={() => onRequestTerminal?.()}><Glyph name="terminal" /> Terminal</button>
+                      <button onClick={() => onRequestOpenWorkspace?.()}><Glyph name="folder_open" /> Switch workspace</button>
+                    </div>
                   </>
                 )}
               </div>
@@ -984,6 +990,10 @@ export default function GitPanel({ projectDir, onProjectChanged, onRefresh, auth
               <div className="git-section">
                 <div className="git-section-title">Browser folder workspace</div>
                 <div className="muted">Git operations are not available for browser-selected folders yet. Open the same repository through a host path for Git status and terminal workflows.</div>
+                <div className="row">
+                  <button onClick={() => onRequestOpenWorkspace?.()}><Glyph name="folder_open" /> Open host path</button>
+                  <button onClick={() => onRequestTerminal?.()}><Glyph name="terminal" /> Terminal</button>
+                </div>
               </div>
             )}
             {!isBrowserWorkspace && !isHostWorkspace && !isRepo && (
