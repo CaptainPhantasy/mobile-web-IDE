@@ -69,6 +69,9 @@ This pattern is deliberate — it reinforces evidence-first thinking and makes t
 <!-- Document architectural decisions in 1-3 sentences each. -->
 <!-- Link to the full rationale in Key Decisions section below if needed. -->
 
+- The IDE is a presentation surface over Floyd Core. Its coding pane uses a server-side `@floyd/sdk` bridge; Floyd Core owns provider routing, OpenCode lifecycle, durable runs, permissions, and evidence.
+- Local folders are first-class workspaces. The UI validates them through `/api/fs/workspace-info`, switches the explorer root, and persists recent/last workspace metadata.
+
 ---
 
 ## Key Decisions
@@ -117,6 +120,7 @@ Every sweep of this SSOT must append one or more entries here. Never edit or rem
 | Timestamp | Section / Line | Fact Verified | Evidence Source | Confidence |
 |---|---|---|---|---|
 | 2026-04-24T22:42:04-0400 | Authority | Document initialized as SSOT | bootstrap.sh --init created from template | 100% |
+| 2026-07-14 00:22 EDT | Architecture / workspace | Floyd Core boundary and local-folder workspace behavior | `npm run lint`; `npm run build`; live `/api/floyd/health` and `/api/fs/workspace-info`; rendered Chrome proof | 100% |
 
 ---
 
@@ -126,6 +130,8 @@ Every sweep of this SSOT must append one or more entries here. Never edit or rem
 
 <!-- Append new entries BELOW this comment line, in chronological order. -->
 <!-- Never edit or remove existing entries — this is the authoritative change history. -->
+
+- 2026-07-14 00:22 EDT — Routed the coding partner through Floyd Core and verified local-folder workspace opening.
 
 ---
 

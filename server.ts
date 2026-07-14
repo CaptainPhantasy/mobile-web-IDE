@@ -17,6 +17,7 @@ import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs/promises';
 import { setupPtyHub } from './pty-hub';
+import { FloydApiError, floyd, resolveFloydProject } from './floyd-core';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,6 +35,18 @@ async function startServer(): Promise<void> {
       time: new Date().toISOString(),
     });
   });
+
+  app.get('/api/floyd/health', asyncHandler(async (req, res) => {
+    const abort = new AbortController();
+    req.once('aborted', () => abort.abort());
+    try { res.json(await floyd.health(abort.signal)); }
+    catch (error) {
+      if (error instanceof FloydApiError) { res.status(error.status).json(error.payload); return; }
+      throw error;
+    }
+  }));
+
+  app.post('/api/floyd/stream', asyncHandler(floydStream));
 
   // --- Git CORS proxy (isomorphic-git expects this path layout).
   // Mounts at /api/git-proxy and rewrites to the "real" origin path
@@ -281,6 +294,49 @@ function asyncHandler(fn: RequestHandler): RequestHandler {
   return (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
+}
+
+async function floydStream(req: Request, res: Response): Promise<void> {
+  const { projectDir, message, sessionId } = req.body as { projectDir?: string; message?: string; sessionId?: string };
+  if (!projectDir || !message?.trim()) { res.status(400).json({ error: 'projectDir and message are required' }); return; }
+  const abort = new AbortController();
+  const cancel = () => abort.abort();
+  req.once('aborted', cancel);
+  res.once('close', cancel);
+  try {
+    let activeSession = sessionId;
+    let runId: string | undefined;
+    if (activeSession) {
+      await floyd.steer(activeSession, message.trim(), 'mobile-web-ide', abort.signal);
+    } else {
+      const projectId = await resolveFloydProject(projectDir, abort.signal);
+      const created = await floyd.submit(projectId, message.trim(), abort.signal);
+      runId = created.run_id;
+      const run = await floyd.run(runId, abort.signal);
+      activeSession = String(run.session_id);
+    }
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    res.write(`data: ${JSON.stringify({ type: 'session', sessionId: activeSession, runId })}\n\n`);
+    for await (const event of floyd.attachSession(activeSession, 'mobile-web-ide', { signal: abort.signal })) {
+      if (abort.signal.aborted) break;
+      const envelope = (event.data || {}) as Record<string, unknown>;
+      const data = (envelope.data || {}) as Record<string, unknown>;
+      if (event.type === 'token' && envelope.channel === 'text') res.write(`data: ${JSON.stringify({ type: 'token', text: String(data.delta ?? data.text ?? '') })}\n\n`);
+      else if (event.type === 'tool_call_start') res.write(`data: ${JSON.stringify({ type: 'tool_call', tool: String(data.tool ?? data.name ?? 'tool') })}\n\n`);
+      else if (event.type === 'error') res.write(`data: ${JSON.stringify({ type: 'error', error: data.message ?? data.error ?? data })}\n\n`);
+      else if (event.type === 'done') break;
+    }
+    if (!abort.signal.aborted) { res.write(`data: ${JSON.stringify({ type: 'done', sessionId: activeSession, runId })}\n\n`); res.end(); }
+  } catch (error) {
+    if (abort.signal.aborted) return;
+    if (!res.headersSent && error instanceof FloydApiError) { res.status(error.status).json(error.payload); return; }
+    const detail = error instanceof Error ? error.message : String(error);
+    if (!res.headersSent) { res.status(503).json({ error: detail }); return; }
+    res.write(`data: ${JSON.stringify({ type: 'error', error: detail })}\n\n`); res.end();
+  } finally { req.off('aborted', cancel); res.off('close', cancel); }
 }
 
 // -------- LLM types --------
