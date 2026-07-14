@@ -46,9 +46,13 @@ import {
 import { localRead, localWrite, localWorkspaceInfo, QUICK_LOCATIONS } from './lib/localfs';
 import { kvGet, kvSet, kvDel } from './lib/kv';
 import {
+  draftStateAfterPublish,
   effectiveWorkspaceRoot,
   FloydExperienceClient,
   FloydSurfaceError,
+  maintainExperienceContinuity,
+  type FloydDraftDivergence,
+  type FloydPublishOutcome,
   type ExperienceEnvelope,
   type ExperienceEnvelopePatch,
   type FloydProjectSummary,
@@ -134,6 +138,7 @@ export default function App() {
   const [experience, setExperience] = useState<ExperienceEnvelope | null>(null);
   const [experienceReady, setExperienceReady] = useState(false);
   const [composerDraft, setComposerDraft] = useState('');
+  const [draftDivergence, setDraftDivergence] = useState<FloydDraftDivergence | null>(null);
 
   const bootedRef = useRef(false);
   const experienceClient = useMemo(() => new FloydExperienceClient(), []);
@@ -376,9 +381,9 @@ export default function App() {
     }
   }, [experienceClient]);
 
-  const enqueuePublish = useCallback((operation: () => Promise<void>): Promise<void> => {
+  const enqueuePublish = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
     const queued = publishQueueRef.current.then(operation, operation);
-    publishQueueRef.current = queued.catch(() => {});
+    publishQueueRef.current = queued.then(() => undefined, () => undefined);
     return queued;
   }, []);
 
@@ -392,39 +397,45 @@ export default function App() {
 
   const publishExperiencePatch = useCallback((
     patch: Omit<ExperienceEnvelopePatch, 'expected_revision'>,
-  ): Promise<void> => enqueuePublish(async () => {
+  ): Promise<FloydPublishOutcome> => enqueuePublish(async () => {
     const current = experienceRef.current;
-    if (!current) return;
-    try {
-      const updated = await experienceClient.update({ ...patch, expected_revision: current.revision });
-      await applyExperienceEnvelope(updated);
-    } catch (error) {
-      if (await applyConflict(error)) return;
-      throw error;
+    if (!current) return { status: 'failed', error: new Error('Floyd experience is not ready') };
+    const outcome = await experienceClient.updateOutcome({ ...patch, expected_revision: current.revision });
+    if (outcome.status === 'applied') {
+      await applyExperienceEnvelope(outcome.envelope);
+    } else if (outcome.status === 'conflict') {
+      if (outcome.envelope) await applyExperienceEnvelope(outcome.envelope);
+      setNotification('Floyd state changed on another surface. Your local action was not published.');
     }
-  }), [applyConflict, applyExperienceEnvelope, enqueuePublish, experienceClient]);
+    return outcome;
+  }), [applyExperienceEnvelope, enqueuePublish, experienceClient]);
 
   // Core wins initial cross-surface restoration. Later stream revisions are
   // applied only when newer; dirty editor buffers are never replaced.
   useEffect(() => {
     if (!bootComplete) return;
     const controller = new AbortController();
-    void (async () => {
-      try {
-        const snapshot = await experienceClient.restore(controller.signal);
+    void maintainExperienceContinuity({
+      signal: controller.signal,
+      restore: (signal) => experienceClient.restore(signal),
+      watch: (lastEventId, signal) => experienceClient.watch(lastEventId, signal),
+      onSnapshot: async (snapshot) => {
         await applyExperienceEnvelope(snapshot.envelope, snapshot.project);
-        if (controller.signal.aborted) return;
-        setExperienceReady(true);
-        for await (const event of experienceClient.watch(String(snapshot.envelope.revision), controller.signal)) {
-          if (event.type !== 'experience' || !event.data || typeof event.data !== 'object') continue;
+        if (!controller.signal.aborted) setExperienceReady(true);
+      },
+      onEvent: async (event) => {
+        if (event.type === 'experience' && event.data && typeof event.data === 'object') {
           await applyExperienceEnvelope(event.data as ExperienceEnvelope);
         }
-      } catch (error) {
+      },
+      onRetry: (_error, attempt, delayMs) => {
+        setNotification(`Floyd experience stream interrupted. Restoring before reconnect ${attempt}/4 in ${delayMs}ms.`);
+      },
+    }).catch((error) => {
         if (!controller.signal.aborted) {
           setNotification(`Floyd experience is unavailable: ${error instanceof Error ? error.message : String(error)}`);
         }
-      }
-    })();
+    });
     return () => controller.abort();
   }, [applyExperienceEnvelope, bootComplete, experienceClient]);
 
@@ -453,8 +464,10 @@ export default function App() {
   useEffect(() => {
     if (!experienceReady || lastPublishedActivityRef.current === activity) return;
     lastPublishedActivityRef.current = activity;
-    void publishExperiencePatch({ selected_view: `ide:${activity}` }).catch((error) => {
-      setNotification(`Could not publish IDE view: ${error instanceof Error ? error.message : String(error)}`);
+    void publishExperiencePatch({ selected_view: `ide:${activity}` }).then((outcome) => {
+      if (outcome.status === 'failed') {
+        setNotification(`Could not publish IDE view: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`);
+      }
     });
   }, [activity, experienceReady, publishExperiencePatch]);
 
@@ -462,10 +475,15 @@ export default function App() {
     if (!experienceReady || !draftDirtyRef.current) return;
     const draft = composerDraft;
     const timer = window.setTimeout(() => {
-      void publishExperiencePatch({ composer_draft: draft }).then(() => {
-        if (composerDraftRef.current === draft) draftDirtyRef.current = false;
-      }).catch((error) => {
-        setNotification(`Could not publish Floyd draft: ${error instanceof Error ? error.message : String(error)}`);
+      void publishExperiencePatch({ composer_draft: draft }).then((outcome) => {
+        const next = draftStateAfterPublish(outcome, draft, composerDraftRef.current);
+        draftDirtyRef.current = next.dirty;
+        setDraftDivergence(next.divergence);
+        if (outcome.status === 'conflict') {
+          setNotification('Floyd draft changed on another surface. Your local draft remains unsent and visible.');
+        } else if (outcome.status === 'failed') {
+          setNotification(`Could not publish Floyd draft: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`);
+        }
       });
     }, 450);
     return () => window.clearTimeout(timer);
@@ -687,6 +705,7 @@ export default function App() {
   const handleComposerDraftChange = useCallback((draft: string) => {
     draftDirtyRef.current = true;
     composerDraftRef.current = draft;
+    setDraftDivergence((current) => current ? { ...current, local: draft } : null);
     setComposerDraft(draft);
   }, []);
 
@@ -697,8 +716,10 @@ export default function App() {
     void publishExperiencePatch({
       active: { session_id: null, run_id: null },
       selected_view: 'ide:ai',
-    }).catch((error) => {
-      setNotification(`Could not clear Floyd session: ${error instanceof Error ? error.message : String(error)}`);
+    }).then((outcome) => {
+      if (outcome.status === 'failed') {
+        setNotification(`Could not clear Floyd session: ${outcome.error instanceof Error ? outcome.error.message : String(outcome.error)}`);
+      }
     });
   }, [publishExperiencePatch]);
 
@@ -914,6 +935,7 @@ export default function App() {
                 projectDir={activeWorkspaceRoot}
                 openFiles={tabs.map((t) => t.path)}
                 draft={composerDraft}
+                draftDivergence={draftDivergence}
                 restoredSessionId={experience?.active.session_id || undefined}
                 restoredRunId={experience?.active.run_id || undefined}
                 onDraftChange={handleComposerDraftChange}

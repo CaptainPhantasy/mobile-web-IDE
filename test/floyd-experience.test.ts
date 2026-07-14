@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { FloydClient } from '../vendor/floyd-sdk/index.js';
 import {
+  draftStateAfterPublish,
   effectiveWorkspaceRoot,
   FloydExperienceClient,
   FloydSurfaceError,
+  maintainExperienceContinuity,
   normalizeFloydTranscript,
   type ExperienceEnvelope,
 } from '../src/lib/floyd-experience.ts';
@@ -53,6 +55,69 @@ test('optimistic conflict preserves Core status and exact newer envelope', async
       return true;
     },
   );
+});
+
+test('typed conflict outcome keeps the current local draft dirty and records divergence', async () => {
+  const newer = { ...envelope(9), composer_draft: 'remote draft' };
+  const client = new FloydExperienceClient(async () => Response.json({
+    error: 'revision_conflict', actual_revision: 9, envelope: newer,
+  }, { status: 409 }));
+  const outcome = await client.updateOutcome({ expected_revision: 4, composer_draft: 'published local' });
+  assert.equal(outcome.status, 'conflict');
+  assert.deepEqual(draftStateAfterPublish(outcome, 'published local', 'newer local edit'), {
+    dirty: true,
+    divergence: { local: 'newer local edit', remote: 'remote draft' },
+  });
+});
+
+test('applied draft clears dirty state only when the local text still matches', () => {
+  const outcome = { status: 'applied' as const, envelope: envelope(5) };
+  assert.deepEqual(draftStateAfterPublish(outcome, 'same', 'same'), { dirty: false, divergence: null });
+  assert.deepEqual(draftStateAfterPublish(outcome, 'published', 'edited again'), { dirty: true, divergence: null });
+});
+
+test('stream failure reconnects through a fresh restore before consuming events', async () => {
+  const controller = new AbortController();
+  const calls: string[] = [];
+  let restores = 0;
+  await maintainExperienceContinuity({
+    signal: controller.signal,
+    retryDelaysMs: [1],
+    sleep: async () => {},
+    restore: async () => {
+      restores += 1;
+      calls.push(`restore:${restores}`);
+      return { envelope: envelope(restores === 1 ? 4 : 8), project: null };
+    },
+    watch: async function* (lastEventId) {
+      calls.push(`watch:${lastEventId}`);
+      if (lastEventId === '4') throw new Error('stream dropped');
+      yield { id: '9', type: 'experience', data: envelope(9) };
+    },
+    onSnapshot: (snapshot) => { calls.push(`snapshot:${snapshot.envelope.revision}`); },
+    onEvent: (event) => {
+      calls.push(`event:${event.id}`);
+      controller.abort();
+    },
+  });
+  assert.deepEqual(calls, [
+    'restore:1', 'snapshot:4', 'watch:4',
+    'restore:2', 'snapshot:8', 'watch:8', 'event:9',
+  ]);
+});
+
+test('stream reconnect is bounded and fails after the configured attempts', async () => {
+  let restores = 0;
+  await assert.rejects(maintainExperienceContinuity({
+    signal: new AbortController().signal,
+    retryDelaysMs: [1, 2],
+    sleep: async () => {},
+    restore: async () => { restores += 1; return { envelope: envelope(restores), project: null }; },
+    watch: async function* () { throw new Error('offline'); },
+    onSnapshot: () => {},
+    onEvent: () => {},
+  }), /offline/);
+  assert.equal(restores, 3);
 });
 
 test('experience watch parses SSE and cancels the browser reader on return', async () => {

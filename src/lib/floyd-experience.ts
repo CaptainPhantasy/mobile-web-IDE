@@ -10,6 +10,72 @@ export type FloydTranscriptSnapshot = {
   engine_session_id: string | null;
   messages: unknown[];
 };
+export type FloydPublishOutcome =
+  | { status: 'applied'; envelope: ExperienceEnvelope }
+  | { status: 'conflict'; envelope: ExperienceEnvelope | null }
+  | { status: 'failed'; error: unknown };
+export type FloydDraftDivergence = { local: string; remote: string | null };
+
+export function draftStateAfterPublish(
+  outcome: FloydPublishOutcome,
+  publishedDraft: string,
+  currentDraft: string,
+): { dirty: boolean; divergence: FloydDraftDivergence | null } {
+  if (outcome.status === 'applied' && currentDraft === publishedDraft) {
+    return { dirty: false, divergence: null };
+  }
+  if (outcome.status === 'conflict') {
+    return { dirty: true, divergence: { local: currentDraft, remote: outcome.envelope?.composer_draft ?? null } };
+  }
+  return { dirty: true, divergence: null };
+}
+
+type ExperienceContinuityOptions = {
+  signal: AbortSignal;
+  restore: (signal: AbortSignal) => Promise<FloydExperienceSnapshot>;
+  watch: (lastEventId: string, signal: AbortSignal) => AsyncIterable<FloydExperienceEvent>;
+  onSnapshot: (snapshot: FloydExperienceSnapshot) => Promise<void> | void;
+  onEvent: (event: FloydExperienceEvent) => Promise<void> | void;
+  onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
+  retryDelaysMs?: readonly number[];
+  sleep?: (delayMs: number, signal: AbortSignal) => Promise<void>;
+};
+
+async function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(done, delayMs);
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    }
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+/** Reconnect at most four times; every attempt starts from a fresh restore. */
+export async function maintainExperienceContinuity(options: ExperienceContinuityOptions): Promise<void> {
+  const delays = options.retryDelaysMs ?? [250, 500, 1_000, 2_000];
+  const sleep = options.sleep ?? abortableDelay;
+  for (let attempt = 0; !options.signal.aborted; attempt += 1) {
+    try {
+      const snapshot = await options.restore(options.signal);
+      await options.onSnapshot(snapshot);
+      for await (const event of options.watch(String(snapshot.envelope.revision), options.signal)) {
+        await options.onEvent(event);
+      }
+      if (options.signal.aborted) return;
+      throw new Error('Floyd experience stream ended unexpectedly');
+    } catch (error) {
+      if (options.signal.aborted) return;
+      if (attempt >= delays.length) throw error;
+      const delayMs = delays[attempt]!;
+      options.onRetry?.(error, attempt + 1, delayMs);
+      await sleep(delayMs, options.signal);
+    }
+  }
+}
 
 export class FloydSurfaceError extends Error {
   constructor(
@@ -96,6 +162,18 @@ export class FloydExperienceClient {
 
   update(patch: ExperienceEnvelopePatch, signal?: AbortSignal): Promise<ExperienceEnvelope> {
     return this.request('PATCH', '/api/floyd/experience', patch, signal);
+  }
+
+  async updateOutcome(patch: ExperienceEnvelopePatch, signal?: AbortSignal): Promise<FloydPublishOutcome> {
+    try {
+      return { status: 'applied', envelope: await this.update(patch, signal) };
+    } catch (error) {
+      if (error instanceof FloydSurfaceError && error.status === 409) {
+        const payload = error.payload as { envelope?: ExperienceEnvelope } | null;
+        return { status: 'conflict', envelope: payload?.envelope ?? null };
+      }
+      return { status: 'failed', error };
+    }
   }
 
   publishWorkspace(rootPath: string, expectedRevision: number, signal?: AbortSignal): Promise<ExperienceEnvelope> {

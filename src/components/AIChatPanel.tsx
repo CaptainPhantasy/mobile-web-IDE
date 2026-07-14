@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Glyph } from './Glyph';
-import { FloydExperienceClient, normalizeFloydTranscript } from '../lib/floyd-experience';
+import { FloydExperienceClient, normalizeFloydTranscript, type FloydDraftDivergence } from '../lib/floyd-experience';
 
 type Props = {
   projectDir: string;
   openFiles: string[];
   draft: string;
+  draftDivergence?: FloydDraftDivergence | null;
   restoredSessionId?: string;
   restoredRunId?: string;
   onDraftChange: (draft: string) => void;
@@ -19,11 +20,18 @@ function renderText(text: string) {
   return text.split('\n').map((line, index) => <span key={index}>{line}{index < text.split('\n').length - 1 && <br />}</span>);
 }
 
+function draftPreview(text: string | null): string {
+  if (text === null) return '(remote draft unavailable)';
+  if (!text) return '(empty)';
+  return text.length > 160 ? `${text.slice(0, 160)}…` : text;
+}
+
 /** Natural-language coding partner. Floyd Core owns routing, tools and state. */
 function AIChatPanel({
   projectDir,
   openFiles,
   draft,
+  draftDivergence,
   restoredSessionId,
   restoredRunId,
   onDraftChange,
@@ -146,6 +154,11 @@ function AIChatPanel({
       {events.map((event, index) => <div key={`event-${index}`} className="ai-tool-card"><div className="ai-tool-header"><Glyph name="ext" /><span className="ai-tool-name">{event}</span></div></div>)}
       {streaming && <div className="ai-msg ai-msg-assistant"><div className="ai-msg-avatar"><Glyph name="ai" /></div><div className="ai-msg-content streaming">{streamText ? renderText(streamText) : 'Working'}<span className="ai-cursor">|</span></div></div>}
     </div>
+    {draftDivergence && <div className="panel-error" role="alert">
+      <div>Draft conflict: your local draft is retained and remains unsent.</div>
+      <div>Local: {draftPreview(draftDivergence.local)}</div>
+      <div>Core: {draftPreview(draftDivergence.remote)}</div>
+    </div>}
     <div className="ai-input-area"><textarea className="ai-input" value={draft} onChange={(event) => onDraftChange(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder={health === 'ready' ? 'Describe the coding outcome...' : 'Floyd Core is offline'} disabled={streaming || health !== 'ready'} rows={2} /><button className="ai-send-btn" onClick={() => void send()} disabled={streaming || health !== 'ready' || !draft.trim()} title="Send"><Glyph name={streaming ? 'spinner' : 'rocket'} /></button></div>
   </div>;
 }
