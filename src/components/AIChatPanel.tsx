@@ -8,6 +8,7 @@ import {
   normalizePendingQuestions,
   type FloydDraftDivergence,
 } from '../lib/floyd-experience';
+import { maintainFloydCodingStream } from '../lib/floyd-coding-stream';
 
 type Props = {
   projectDir: string;
@@ -26,7 +27,6 @@ type Props = {
   onFileChanged?: (path: string) => void;
 };
 type Message = { role: 'user' | 'assistant' | 'system'; content: string };
-type StreamEvent = { type: string; text?: string; error?: unknown; tool?: string; sessionId?: string; runId?: string };
 
 function renderText(text: string) {
   return text.split('\n').map((line, index) => <span key={index}>{line}{index < text.split('\n').length - 1 && <br />}</span>);
@@ -36,6 +36,15 @@ function draftPreview(text: string | null): string {
   if (text === null) return '(remote draft unavailable)';
   if (!text) return '(empty)';
   return text.length > 160 ? `${text.slice(0, 160)}…` : text;
+}
+
+export function provisionalAfterTranscriptRestore(messages: Message[], provisional: string): string {
+  if (!provisional) return '';
+  const restoredAssistant = [...messages].reverse().find((message) => message.role === 'assistant')?.content || '';
+  if (!restoredAssistant) return provisional;
+  if (restoredAssistant.endsWith(provisional)) return '';
+  if (provisional.startsWith(restoredAssistant)) return provisional.slice(restoredAssistant.length);
+  return provisional;
 }
 
 /** Natural-language coding partner. Floyd Core owns routing, tools and state. */
@@ -57,6 +66,7 @@ function AIChatPanel({
   const [messages, setMessages] = useState<Message[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState('');
+  const [streamIncomplete, setStreamIncomplete] = useState(false);
   const [health, setHealth] = useState<'checking' | 'ready' | 'offline'>('checking');
   const [sessionId, setSessionId] = useState<string | undefined>(restoredSessionId);
   const [runId, setRunId] = useState<string | undefined>(restoredRunId);
@@ -73,6 +83,8 @@ function AIChatPanel({
   const transcriptGenerationRef = useRef(0);
   const artifactGenerationRef = useRef(0);
   const contextGenerationRef = useRef(0);
+  const codingGenerationRef = useRef(0);
+  const activeStreamContextRef = useRef<{ generation: number; sessionId?: string; runId?: string } | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
   const experienceClient = useMemo(() => new FloydExperienceClient(), []);
   const questions = useMemo(() => normalizePendingQuestions(pendingQuestions), [pendingQuestions]);
@@ -142,6 +154,15 @@ function AIChatPanel({
 
   useEffect(() => {
     contextGenerationRef.current += 1;
+    const activeStream = activeStreamContextRef.current;
+    if (activeStream && (activeStream.sessionId !== restoredSessionId || activeStream.runId !== restoredRunId)) {
+      codingGenerationRef.current += 1;
+      abortRef.current?.abort();
+      activeStreamContextRef.current = null;
+      setStreaming(false);
+      setStreamText('');
+      setStreamIncomplete(false);
+    }
     interactionAbortRef.current?.abort();
     interactionAbortRef.current = undefined;
     setInteractionBusy(null);
@@ -151,12 +172,14 @@ function AIChatPanel({
   }, [restoredRunId, restoredSessionId]);
 
   const newConversation = useCallback(() => {
+    codingGenerationRef.current += 1;
     abortRef.current?.abort();
     transcriptAbortRef.current?.abort();
     artifactAbortRef.current?.abort();
     interactionAbortRef.current?.abort();
     transcriptGenerationRef.current += 1;
-    setMessages([]); setStreamText(''); setEvents([]); setSessionId(undefined); setRunId(undefined); setStreaming(false);
+    activeStreamContextRef.current = null;
+    setMessages([]); setStreamText(''); setStreamIncomplete(false); setEvents([]); setSessionId(undefined); setRunId(undefined); setStreaming(false);
     onContextChange({ sessionId: null, runId: null });
   }, [onContextChange]);
 
@@ -218,44 +241,81 @@ function AIChatPanel({
     if (!prompt || streaming || health !== 'ready') return;
     const controller = new AbortController();
     abortRef.current = controller;
-    onDraftChange(''); setStreaming(true); setStreamText(''); setEvents([]);
+    const generation = ++codingGenerationRef.current;
+    activeStreamContextRef.current = { generation, sessionId, runId };
+    const current = () => !controller.signal.aborted && generation === codingGenerationRef.current;
+    onDraftChange(''); setStreaming(true); setStreamText(''); setStreamIncomplete(false); setEvents([]);
     setMessages((prior) => [...prior, { role: 'user', content: prompt }]);
     let accumulated = '';
+    let completed = false;
     try {
-      const response = await fetch('/api/floyd/stream', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ projectDir, message: prompt, sessionId, runId }), signal: controller.signal,
-      });
-      if (!response.ok || !response.body) throw new Error(`Floyd Core returned HTTP ${response.status}: ${await response.text()}`);
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true }).replace(/\r\n?/g, '\n');
-          const frames = buffer.split('\n\n'); buffer = frames.pop() || '';
-          for (const frame of frames) {
-            const raw = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
-            if (!raw) continue;
-            const event = JSON.parse(raw) as StreamEvent;
-            if (event.sessionId) {
-              setSessionId(event.sessionId);
-              setRunId(event.runId);
-              onContextChange({ sessionId: event.sessionId, runId: event.runId || null });
+      await maintainFloydCodingStream({
+        signal: controller.signal,
+        open: (cursor, signal) => fetch('/api/floyd/stream', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(cursor.resume
+            ? { projectDir, sessionId: cursor.sessionId, runId: cursor.runId, lastEventId: cursor.lastEventId, resume: true }
+            : { projectDir, message: prompt, ...(sessionId && runId ? { sessionId, runId } : {}), resume: false }),
+          signal,
+        }),
+        restore: (activeSessionId, activeRunId, signal) => experienceClient.transcript(activeSessionId, activeRunId, signal),
+        onRestore: (snapshot) => {
+          if (!current()) return;
+          const restored = normalizeFloydTranscript(snapshot.messages);
+          accumulated = provisionalAfterTranscriptRestore(restored, accumulated);
+          setMessages(restored);
+          setStreamText(accumulated);
+        },
+        onSession: (activeSessionId, activeRunId) => {
+          if (!current()) return;
+          activeStreamContextRef.current = { generation, sessionId: activeSessionId, runId: activeRunId };
+          setSessionId(activeSessionId);
+          setRunId(activeRunId);
+          onContextChange({ sessionId: activeSessionId, runId: activeRunId });
+        },
+        onToken: (text) => {
+          if (!current()) return;
+          accumulated += text;
+          setStreamText(accumulated);
+        },
+        onTool: (tool) => {
+          if (current()) setEvents((prior) => [...prior, `Tool: ${tool}`]);
+        },
+        onRetry: (_error, attempt, delayMs) => {
+          if (current()) setEvents((prior) => [...prior, `Stream interrupted. Restoring and reconnecting ${attempt}/4 in ${delayMs}ms.`]);
+        },
+        onDone: async (event) => {
+          if (!current()) return;
+          completed = true;
+          const activeSessionId = event.sessionId || activeStreamContextRef.current?.sessionId;
+          const activeRunId = event.runId || activeStreamContextRef.current?.runId;
+          if (activeSessionId && activeRunId) {
+            try {
+              const snapshot = await experienceClient.transcript(activeSessionId, activeRunId, controller.signal);
+              if (current()) setMessages(normalizeFloydTranscript(snapshot.messages));
+            } catch (error) {
+              if (current() && accumulated) setMessages((prior) => [...prior, { role: 'assistant', content: accumulated }]);
+              if (current()) setEvents((prior) => [...prior, `Completed, but final transcript refresh failed: ${error instanceof Error ? error.message : String(error)}`]);
             }
-            if (event.type === 'token' && event.text) { accumulated += event.text; setStreamText(accumulated); }
-            else if (event.type === 'tool_call') setEvents((prior) => [...prior, `Tool: ${event.tool || 'unknown'}`]);
-            else if (event.type === 'error') throw new Error(typeof event.error === 'string' ? event.error : JSON.stringify(event.error));
+          } else if (accumulated) {
+            setMessages((prior) => [...prior, { role: 'assistant', content: accumulated }]);
           }
-        }
-      } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
-      if (accumulated) setMessages((prior) => [...prior, { role: 'assistant', content: accumulated }]);
+        },
+      });
     } catch (error) {
-      if (!controller.signal.aborted) setMessages((prior) => [...prior, { role: 'system', content: error instanceof Error ? error.message : String(error) }]);
-    } finally { if (!controller.signal.aborted) { setStreaming(false); setStreamText(''); } }
-  }, [draft, health, onContextChange, onDraftChange, projectDir, runId, sessionId, streaming]);
+      if (current()) {
+        setStreamIncomplete(Boolean(accumulated));
+        setMessages((prior) => [...prior, { role: 'system', content: `Stream interrupted before completion: ${error instanceof Error ? error.message : String(error)}` }]);
+      }
+    } finally {
+      if (current()) {
+        setStreaming(false);
+        if (completed) { setStreamText(''); setStreamIncomplete(false); }
+        activeStreamContextRef.current = null;
+      }
+    }
+  }, [draft, experienceClient, health, onContextChange, onDraftChange, projectDir, runId, sessionId, streaming]);
 
   return <div className="panel ai-panel">
     <div className="panel-header"><span className="panel-title">Floyd Coding Partner</span><div className="panel-actions">
@@ -322,6 +382,7 @@ function AIChatPanel({
       {messages.map((message, index) => <div key={index} className={`ai-msg ai-msg-${message.role === 'system' ? 'assistant' : message.role}`}><div className="ai-msg-avatar"><Glyph name={message.role === 'user' ? 'collab' : message.role === 'system' ? 'err' : 'ai'} /></div><div className="ai-msg-content">{renderText(message.content)}</div></div>)}
       {events.map((event, index) => <div key={`event-${index}`} className="ai-tool-card"><div className="ai-tool-header"><Glyph name="ext" /><span className="ai-tool-name">{event}</span></div></div>)}
       {streaming && <div className="ai-msg ai-msg-assistant"><div className="ai-msg-avatar"><Glyph name="ai" /></div><div className="ai-msg-content streaming">{streamText ? renderText(streamText) : 'Working'}<span className="ai-cursor">|</span></div></div>}
+      {streamIncomplete && streamText && !streaming && <div className="ai-msg ai-msg-assistant"><div className="ai-msg-avatar"><Glyph name="err" /></div><div className="ai-msg-content"><strong>Incomplete output (not finalized)</strong><br />{renderText(streamText)}</div></div>}
     </div>
     {draftDivergence && <div className="panel-error" role="alert">
       <div>Draft conflict: your local draft is retained and remains unsent.</div>

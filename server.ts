@@ -524,47 +524,90 @@ async function floydExperienceStream(req: Request, res: Response): Promise<void>
 }
 
 async function floydStream(req: Request, res: Response): Promise<void> {
-  const { projectDir, message, sessionId, runId: requestedRunId } = req.body as { projectDir?: string; message?: string; sessionId?: string; runId?: string };
-  if (!projectDir || !message?.trim()) { res.status(400).json({ error: 'projectDir and message are required' }); return; }
-  const abort = new AbortController();
-  const cancel = () => abort.abort();
-  req.once('aborted', cancel);
-  res.once('close', cancel);
+  const {
+    projectDir,
+    message,
+    sessionId,
+    runId: requestedRunId,
+    lastEventId,
+    resume = false,
+  } = req.body as {
+    projectDir?: string;
+    message?: string;
+    sessionId?: string;
+    runId?: string;
+    lastEventId?: string;
+    resume?: boolean;
+  };
+  if (!projectDir) { res.status(400).json({ error: 'projectDir is required' }); return; }
+  if (resume && (!sessionId || !requestedRunId)) {
+    res.status(400).json({ error: 'resume requires sessionId and runId' });
+    return;
+  }
+  if (!resume && !message?.trim()) { res.status(400).json({ error: 'message is required for a new stream' }); return; }
+  if (lastEventId !== undefined && !/^\d{1,20}$/.test(lastEventId)) {
+    res.status(400).json({ error: 'lastEventId must be a numeric Core event cursor' });
+    return;
+  }
+  const request = requestAbort(req, res);
   try {
     let activeSession = sessionId;
     let runId: string | undefined = requestedRunId;
-    if (activeSession) {
-      await floyd.steer(activeSession, message.trim(), 'mobile-web-ide', abort.signal, runId);
+    if (resume) {
+      // A reconnect is transport recovery only. Never replay the user's prompt.
+      activeSession = sessionId;
+      runId = requestedRunId;
+    } else if (activeSession) {
+      await floyd.steer(activeSession, message!.trim(), 'mobile-web-ide', request.signal, runId);
     } else {
-      const projectId = await resolveFloydProject(projectDir, abort.signal);
-      const created = await floyd.submit(projectId, message.trim(), abort.signal);
+      const projectId = await resolveFloydProject(projectDir, request.signal);
+      const created = await floyd.submit(projectId, message!.trim(), request.signal);
       runId = created.run_id;
-      const run = await floyd.run(runId, abort.signal);
+      const run = await floyd.run(runId, request.signal);
       activeSession = String(run.session_id);
-      await publishFloydRunContext(projectId, activeSession, runId, abort.signal);
+      await publishFloydRunContext(projectId, activeSession, runId, request.signal);
     }
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
-    res.write(`data: ${JSON.stringify({ type: 'session', sessionId: activeSession, runId })}\n\n`);
-    for await (const event of floyd.attachSession(activeSession, 'mobile-web-ide', { signal: abort.signal, runId })) {
-      if (abort.signal.aborted) break;
+    writeFloydSse(res, { type: 'session', data: { sessionId: activeSession, runId } });
+    for await (const event of floyd.attachSession(activeSession!, 'mobile-web-ide', {
+      signal: request.signal,
+      runId,
+      ...(lastEventId ? { lastEventId } : {}),
+    })) {
+      if (request.signal.aborted) break;
       const envelope = (event.data || {}) as Record<string, unknown>;
       const data = (envelope.data || {}) as Record<string, unknown>;
-      if (event.type === 'token' && envelope.channel === 'text') res.write(`data: ${JSON.stringify({ type: 'token', text: String(data.delta ?? data.text ?? '') })}\n\n`);
-      else if (event.type === 'tool_call_start') res.write(`data: ${JSON.stringify({ type: 'tool_call', tool: String(data.tool ?? data.name ?? 'tool') })}\n\n`);
-      else if (event.type === 'error') res.write(`data: ${JSON.stringify({ type: 'error', error: data.message ?? data.error ?? data })}\n\n`);
-      else if (event.type === 'done') break;
+      if (event.type === 'token' && envelope.channel === 'text') {
+        writeFloydSse(res, { id: event.id, type: 'token', data: { text: String(data.delta ?? data.text ?? '') } });
+      } else if (event.type === 'tool_call_start') {
+        writeFloydSse(res, { id: event.id, type: 'tool_call', data: { tool: String(data.tool ?? data.name ?? 'tool') } });
+      } else if (event.type === 'error') {
+        writeFloydSse(res, { id: event.id, type: 'error', data: { error: data.message ?? data.error ?? data, retryable: false } });
+        res.end();
+        return;
+      } else if (event.type === 'done') {
+        writeFloydSse(res, { id: event.id, type: 'done', data: { sessionId: activeSession, runId } });
+        res.end();
+        return;
+      }
     }
-    if (!abort.signal.aborted) { res.write(`data: ${JSON.stringify({ type: 'done', sessionId: activeSession, runId })}\n\n`); res.end(); }
+    // Natural iterator EOF is not completion. Close without a done event so the
+    // browser resumes from the last acknowledged Core event ID.
+    if (!request.signal.aborted) res.end();
   } catch (error) {
-    if (abort.signal.aborted) return;
+    if (request.signal.aborted) return;
     if (!res.headersSent && error instanceof FloydApiError) { res.status(error.status).json(error.payload); return; }
     const detail = error instanceof Error ? error.message : String(error);
     if (!res.headersSent) { res.status(503).json({ error: detail }); return; }
-    res.write(`data: ${JSON.stringify({ type: 'error', error: detail })}\n\n`); res.end();
-  } finally { req.off('aborted', cancel); res.off('close', cancel); }
+    writeFloydSse(res, {
+      type: 'error',
+      data: { error: detail, retryable: !(error instanceof FloydApiError) || error.status >= 500 },
+    });
+    res.end();
+  } finally { request.dispose(); }
 }
 
 // -------- LLM types --------
