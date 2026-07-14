@@ -29,6 +29,8 @@ export class FloydClient {
   run(runId:string,signal?:AbortSignal):Promise<Record<string,unknown>>;
   artifactById(artifactId:string,signal?:AbortSignal):Promise<unknown>;
   steer(sessionId:string,text:string,actor:string,signal?:AbortSignal,runId?:string):Promise<unknown>;
+  answer(sessionId:string,requestId:string,answers:string[][],actor:string,signal?:AbortSignal,runId?:string):Promise<unknown>;
+  permission(sessionId:string,requestId:string,reply:'once'|'always'|'reject',actor:string,signal?:AbortSignal,runId?:string):Promise<unknown>;
   negotiateExperience(input:{surface_id:string;capabilities:string[];sdk_version?:string;supported_envelope_versions?:string[]},signal?:AbortSignal):Promise<{accepted:boolean;envelope_version:string|null;core_protocol_version:string;minimum_sdk_version:string;reason?:string}>;
   experience(envelopeId?:string,signal?:AbortSignal):Promise<ExperienceEnvelope>;
   updateExperience(envelopeId:string,patch:ExperienceEnvelopePatch,signal?:AbortSignal):Promise<ExperienceEnvelope>;

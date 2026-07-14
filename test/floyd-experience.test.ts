@@ -1,13 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { FloydClient } from '../vendor/floyd-sdk/index.js';
+import { FLOYD_IDE_CAPABILITIES } from '../floyd-core.ts';
 import {
   draftStateAfterPublish,
   effectiveWorkspaceRoot,
+  formatFloydArtifact,
   FloydExperienceClient,
   FloydSurfaceError,
   maintainExperienceContinuity,
   normalizeFloydTranscript,
+  normalizePendingPermissions,
+  normalizePendingQuestions,
+  restoredIdeActivity,
+  visibleModelRoute,
   type ExperienceEnvelope,
 } from '../src/lib/floyd-experience.ts';
 
@@ -74,6 +80,82 @@ test('applied draft clears dirty state only when the local text still matches', 
   const outcome = { status: 'applied' as const, envelope: envelope(5) };
   assert.deepEqual(draftStateAfterPublish(outcome, 'same', 'same'), { dirty: false, divergence: null });
   assert.deepEqual(draftStateAfterPublish(outcome, 'published', 'edited again'), { dirty: true, divergence: null });
+});
+
+test('portable artifact selection restores the IDE coding view and formats readable content', () => {
+  assert.equal(restoredIdeActivity('cockpit:artifact', 'artifact-one'), 'ai');
+  assert.equal(restoredIdeActivity('ide:artifact', null), 'ai');
+  assert.equal(restoredIdeActivity('ide:files', null), 'files');
+  assert.equal(restoredIdeActivity('desktop-chat', null), null);
+  assert.equal(formatFloydArtifact('plain diff'), 'plain diff');
+  assert.equal(formatFloydArtifact({ status: 'pass', count: 3 }), '{\n  "status": "pass",\n  "count": 3\n}');
+});
+
+test('pending interaction snapshots normalize exact request ids, prompts, options, and resources', () => {
+  assert.deepEqual(normalizePendingQuestions([{
+    type: 'question',
+    data: { id: 'que/1', questions: [{ question: 'Choose scope', multiple: true, options: [{ label: 'File' }, { label: 'Workspace' }] }] },
+  }]), [{ id: 'que/1', prompts: [{ prompt: 'Choose scope', options: ['File', 'Workspace'], multiple: true }] }]);
+  assert.deepEqual(normalizePendingPermissions([{
+    type: 'permission', data: { id: 'per/1', action: 'write', resources: ['/tmp/result'] },
+  }]), [{ id: 'per/1', action: 'write', resources: ['/tmp/result'] }]);
+});
+
+test('run-scoped answer and permission relays preserve paths, payloads, and Core errors', async () => {
+  const requests: Array<{ path: string; body: unknown }> = [];
+  const client = new FloydExperienceClient(async (input, init) => {
+    requests.push({ path: String(input), body: init?.body ? JSON.parse(String(init.body)) : null });
+    return Response.json({ delivered: true }, { status: 202 });
+  });
+  await client.answerQuestion('session/one', 'run/one', 'question/one', [['Workspace']]);
+  await client.decidePermission('session/one', 'run/one', 'permission/one', 'once');
+  assert.deepEqual(requests, [
+    {
+      path: '/api/floyd/sessions/session%2Fone/questions/question%2Fone/answer',
+      body: { run_id: 'run/one', answers: [['Workspace']] },
+    },
+    {
+      path: '/api/floyd/sessions/session%2Fone/permissions/permission%2Fone',
+      body: { run_id: 'run/one', reply: 'once' },
+    },
+  ]);
+
+  const failed = new FloydExperienceClient(async () => Response.json({ error: 'permission expired', request_id: 'permission/one' }, { status: 410 }));
+  await assert.rejects(failed.decidePermission('session', 'run', 'permission/one', 'reject'), (error: unknown) => {
+    assert.ok(error instanceof FloydSurfaceError);
+    assert.equal(error.status, 410);
+    assert.deepEqual(error.payload, { error: 'permission expired', request_id: 'permission/one' });
+    return true;
+  });
+});
+
+test('run-scoped interaction request propagates caller abort', async () => {
+  let observedAbort = false;
+  const client = new FloydExperienceClient((_input, init) => new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => {
+      observedAbort = true;
+      reject(new DOMException('aborted', 'AbortError'));
+    }, { once: true });
+  }));
+  const controller = new AbortController();
+  const pending = client.answerQuestion('session', 'run', 'question', [['answer']], controller.signal);
+  controller.abort();
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(observedAbort, true);
+});
+
+test('IDE negotiates only its implemented connected-experience capabilities', () => {
+  assert.deepEqual(FLOYD_IDE_CAPABILITIES, [
+    'active-context', 'artifacts', 'coding-runs', 'composer', 'drafts', 'durable-transcript',
+    'experience-stream', 'files', 'model-route-display', 'permissions', 'questions', 'selected-view',
+    'terminal', 'workspaces',
+  ]);
+  assert.equal(FLOYD_IDE_CAPABILITIES.includes('connectors' as never), false);
+  assert.equal(FLOYD_IDE_CAPABILITIES.includes('credential-ref' as never), false);
+  assert.deepEqual(visibleModelRoute({
+    provider: 'anthropic', model: 'claude-sonnet', base_url: 'https://example.invalid',
+    provider_profile_id: 'profile-secret', credential_ref: 'credential-secret',
+  }), { provider: 'anthropic', model: 'claude-sonnet' });
 });
 
 test('stream failure reconnects through a fresh restore before consuming events', async () => {
@@ -187,12 +269,17 @@ test('transcript endpoint preserves server errors and caller abort', async () =>
   assert.equal(observedAbort, true);
 });
 
-test('vendored SDK exposes negotiation, optimistic update, artifact and Last-Event-ID watch', async () => {
-  const seen: Array<{ path: string; method: string; lastEventId: string | null }> = [];
+test('vendored SDK exposes negotiation, optimistic update, artifact, interactions, and Last-Event-ID watch', async () => {
+  const seen: Array<{ path: string; method: string; lastEventId: string | null; body: unknown }> = [];
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
     const headers = new Headers(init?.headers);
-    seen.push({ path: url.pathname, method: init?.method || 'GET', lastEventId: headers.get('last-event-id') });
+    seen.push({
+      path: url.pathname,
+      method: init?.method || 'GET',
+      lastEventId: headers.get('last-event-id'),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    });
     if (url.pathname.endsWith('/stream')) {
       return new Response(`event: experience\ndata: ${JSON.stringify(envelope(7))}\n\n`, {
         headers: { 'content-type': 'text/event-stream' },
@@ -205,6 +292,8 @@ test('vendored SDK exposes negotiation, optimistic update, artifact and Last-Eve
   await sdk.experience();
   await sdk.updateExperience('primary', { expected_revision: 4, composer_draft: 'next' });
   await sdk.artifactById('artifact/one');
+  await sdk.answer('session/one', 'question/one', [['answer']], 'ide', undefined, 'run/one');
+  await sdk.permission('session/one', 'permission/one', 'always', 'ide', undefined, 'run/one');
   const iterator = sdk.watchExperience('primary', { lastEventId: '6' });
   assert.equal((await iterator.next()).value?.data.revision, 7);
   await iterator.return(undefined);
@@ -213,6 +302,14 @@ test('vendored SDK exposes negotiation, optimistic update, artifact and Last-Eve
     ['GET', '/api/experience/primary', null],
     ['PATCH', '/api/experience/primary', null],
     ['GET', '/api/artifacts/artifact%2Fone', null],
+    ['POST', '/api/sessions/session%2Fone/steer', null],
+    ['POST', '/api/sessions/session%2Fone/steer', null],
     ['GET', '/api/experience/primary/stream', '6'],
   ]);
+  assert.deepEqual(seen[4]?.body, {
+    type: 'answer', request_id: 'question/one', answers: [['answer']], actor: 'ide', run_id: 'run/one',
+  });
+  assert.deepEqual(seen[5]?.body, {
+    type: 'permission', request_id: 'permission/one', reply: 'always', actor: 'ide', run_id: 'run/one',
+  });
 });

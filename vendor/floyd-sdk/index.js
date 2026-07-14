@@ -14,6 +14,8 @@ export class FloydClient {
   run(runId,signal){return this.request('GET',`/api/runs/${encodeURIComponent(runId)}`,undefined,signal)}
   artifactById(artifactId,signal){return this.request('GET',`/api/artifacts/${encodeURIComponent(artifactId)}`,undefined,signal)}
   steer(sessionId,text,actor,signal,runId){return this.request('POST',`/api/sessions/${encodeURIComponent(sessionId)}/steer`,{type:'steer',text,actor,...(runId?{run_id:runId}:{})},signal)}
+  answer(sessionId,requestId,answers,actor,signal,runId){return this.request('POST',`/api/sessions/${encodeURIComponent(sessionId)}/steer`,{type:'answer',request_id:requestId,answers,actor,...(runId?{run_id:runId}:{})},signal)}
+  permission(sessionId,requestId,reply,actor,signal,runId){return this.request('POST',`/api/sessions/${encodeURIComponent(sessionId)}/steer`,{type:'permission',request_id:requestId,reply,actor,...(runId?{run_id:runId}:{})},signal)}
   negotiateExperience({surface_id,capabilities,sdk_version=FLOYD_SDK_PROTOCOL_VERSION,supported_envelope_versions=[FLOYD_EXPERIENCE_VERSION]},signal){return this.request('POST','/api/experience/negotiate',{surface_id,capabilities,sdk_version,supported_envelope_versions},signal)}
   experience(envelopeId='primary',signal){return this.request('GET',`/api/experience/${encodeURIComponent(envelopeId)}`,undefined,signal)}
   updateExperience(envelopeId,patch,signal){return this.request('PATCH',`/api/experience/${encodeURIComponent(envelopeId)}`,patch,signal)}

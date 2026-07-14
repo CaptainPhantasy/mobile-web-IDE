@@ -15,12 +15,18 @@ export const floyd = new FloydClient({
 
 export const FLOYD_IDE_SURFACE_ID = 'ide';
 export const FLOYD_IDE_CAPABILITIES = [
+  'active-context',
   'artifacts',
   'coding-runs',
   'composer',
   'drafts',
+  'durable-transcript',
   'experience-stream',
   'files',
+  'model-route-display',
+  'permissions',
+  'questions',
+  'selected-view',
   'terminal',
   'workspaces',
 ] as const;
@@ -52,6 +58,26 @@ export async function getFloydProject(projectId: string, signal: AbortSignal): P
 
 export function updateFloydExperience(patch: ExperienceEnvelopePatch, signal: AbortSignal): Promise<ExperienceEnvelope> {
   return floyd.updateExperience('primary', patch, signal);
+}
+
+export function answerFloydQuestion(
+  sessionId: string,
+  runId: string,
+  requestId: string,
+  answers: string[][],
+  signal: AbortSignal,
+): Promise<unknown> {
+  return floyd.answer(sessionId, requestId, answers, 'mobile-web-ide', signal, runId);
+}
+
+export function decideFloydPermission(
+  sessionId: string,
+  runId: string,
+  requestId: string,
+  reply: 'once' | 'always' | 'reject',
+  signal: AbortSignal,
+): Promise<unknown> {
+  return floyd.permission(sessionId, requestId, reply, 'mobile-web-ide', signal, runId);
 }
 
 export async function publishFloydWorkspace(rootPath: string, expectedRevision: number, signal: AbortSignal): Promise<ExperienceEnvelope> {

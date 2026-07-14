@@ -18,6 +18,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs/promises';
 import { setupPtyHub } from './pty-hub';
 import {
+  answerFloydQuestion,
+  decideFloydPermission,
   FloydApiError,
   floyd,
   getFloydExperience,
@@ -64,6 +66,8 @@ async function startServer(): Promise<void> {
   app.get('/api/floyd/experience/stream', asyncHandler(floydExperienceStream));
   app.post('/api/floyd/workspace', asyncHandler(floydWorkspacePublish));
   app.get('/api/floyd/sessions/:sessionId/transcript', asyncHandler(floydTranscriptGet));
+  app.post('/api/floyd/sessions/:sessionId/questions/:requestId/answer', asyncHandler(floydQuestionAnswer));
+  app.post('/api/floyd/sessions/:sessionId/permissions/:requestId', asyncHandler(floydPermissionDecision));
   app.get('/api/floyd/projects/:projectId', asyncHandler(floydProjectGet));
   app.get('/api/floyd/artifacts/:artifactId', asyncHandler(floydArtifactGet));
 
@@ -439,6 +443,44 @@ async function floydTranscriptGet(req: Request, res: Response): Promise<void> {
     await iterator.return(undefined).catch(() => {});
     request.dispose();
   }
+}
+
+async function floydQuestionAnswer(req: Request, res: Response): Promise<void> {
+  const runId = typeof req.body?.run_id === 'string' ? req.body.run_id.trim() : '';
+  const answers = req.body?.answers;
+  const validAnswers = Array.isArray(answers)
+    && answers.length > 0
+    && answers.every((answer) => Array.isArray(answer) && answer.length > 0 && answer.every((item) => typeof item === 'string' && item.trim()));
+  if (!runId || !validAnswers) {
+    res.status(400).json({ error: 'run_id and non-empty answers are required' });
+    return;
+  }
+  const abort = requestAbort(req, res);
+  try { res.status(202).json(await answerFloydQuestion(req.params.sessionId, runId, req.params.requestId, answers, abort.signal)); }
+  catch (error) {
+    if (!abort.signal.aborted) sendFloydFailure(res, error);
+  } finally { abort.dispose(); }
+}
+
+async function floydPermissionDecision(req: Request, res: Response): Promise<void> {
+  const runId = typeof req.body?.run_id === 'string' ? req.body.run_id.trim() : '';
+  const reply = req.body?.reply;
+  if (!runId || !['once', 'always', 'reject'].includes(reply)) {
+    res.status(400).json({ error: 'run_id and reply (once, always, or reject) are required' });
+    return;
+  }
+  const abort = requestAbort(req, res);
+  try {
+    res.status(202).json(await decideFloydPermission(
+      req.params.sessionId,
+      runId,
+      req.params.requestId,
+      reply as 'once' | 'always' | 'reject',
+      abort.signal,
+    ));
+  } catch (error) {
+    if (!abort.signal.aborted) sendFloydFailure(res, error);
+  } finally { abort.dispose(); }
 }
 
 function writeFloydSse(res: Response, event: { id?: string; type: string; data: unknown }): void {

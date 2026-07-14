@@ -51,6 +51,8 @@ import {
   FloydExperienceClient,
   FloydSurfaceError,
   maintainExperienceContinuity,
+  restoredIdeActivity,
+  visibleModelRoute,
   type FloydDraftDivergence,
   type FloydPublishOutcome,
   type ExperienceEnvelope,
@@ -341,13 +343,18 @@ export default function App() {
 
     if (!draftDirtyRef.current) setComposerDraft(envelope.composer_draft);
 
-    if (envelope.selected_view.startsWith('ide:')) {
-      const desired = envelope.selected_view.slice(4) as Activity;
-      if (ACTIVITIES.has(desired)) {
-        lastPublishedActivityRef.current = desired;
-        activityRef.current = desired;
-        setActivity(desired);
-      }
+    const restoredActivity = restoredIdeActivity(envelope.selected_view, envelope.selected_artifact_id) as Activity | null;
+    if (envelope.selected_artifact_id && restoredActivity === 'ai') {
+      // Artifacts are portable across surfaces. The IDE restores them in the
+      // coding pane without rewriting the originating surface's view string.
+      lastPublishedActivityRef.current = 'ai';
+      activityRef.current = 'ai';
+      setActivity('ai');
+      setSideOpen(true);
+    } else if (restoredActivity && ACTIVITIES.has(restoredActivity)) {
+      lastPublishedActivityRef.current = restoredActivity;
+      activityRef.current = restoredActivity;
+      setActivity(restoredActivity);
     } else {
       // Do not claim another surface's selected view merely because this IDE
       // attached. Only a later user navigation publishes an IDE view.
@@ -936,6 +943,11 @@ export default function App() {
                 openFiles={tabs.map((t) => t.path)}
                 draft={composerDraft}
                 draftDivergence={draftDivergence}
+                selectedArtifactId={experience?.selected_artifact_id}
+                selectedView={experience?.selected_view}
+                pendingQuestions={experience?.pending_questions}
+                pendingPermissions={experience?.pending_permissions}
+                modelRoute={experience ? visibleModelRoute(experience.model_route) : undefined}
                 restoredSessionId={experience?.active.session_id || undefined}
                 restoredRunId={experience?.active.run_id || undefined}
                 onDraftChange={handleComposerDraftChange}

@@ -15,6 +15,11 @@ export type FloydPublishOutcome =
   | { status: 'conflict'; envelope: ExperienceEnvelope | null }
   | { status: 'failed'; error: unknown };
 export type FloydDraftDivergence = { local: string; remote: string | null };
+export type FloydPendingQuestion = {
+  id: string;
+  prompts: Array<{ prompt: string; options: string[]; multiple: boolean }>;
+};
+export type FloydPendingPermission = { id: string; action: string; resources: string[] };
 
 export function draftStateAfterPublish(
   outcome: FloydPublishOutcome,
@@ -28,6 +33,69 @@ export function draftStateAfterPublish(
     return { dirty: true, divergence: { local: currentDraft, remote: outcome.envelope?.composer_draft ?? null } };
   }
   return { dirty: true, divergence: null };
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+function pendingData(value: unknown): Record<string, unknown> {
+  const outer = recordValue(value);
+  return Object.keys(recordValue(outer.data)).length ? recordValue(outer.data) : outer;
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    const option = recordValue(item);
+    const display = option.label ?? option.value ?? option.name;
+    if (display !== undefined) return String(display);
+    return typeof item === 'string' ? item : JSON.stringify(item);
+  }).filter(Boolean);
+}
+
+export function normalizePendingQuestions(values: unknown[]): FloydPendingQuestion[] {
+  return values.map((value) => {
+    const data = pendingData(value);
+    const rawQuestions = Array.isArray(data.questions) ? data.questions : [data];
+    const prompts = rawQuestions.map((raw, index) => {
+      const question = recordValue(raw);
+      return {
+        prompt: String(question.question ?? question.prompt ?? question.text ?? question.header ?? `Question ${index + 1}`),
+        options: stringList(question.options),
+        multiple: question.multiple === true,
+      };
+    });
+    return { id: String(data.id ?? data.request_id ?? ''), prompts };
+  }).filter((request) => request.id && request.prompts.length);
+}
+
+export function normalizePendingPermissions(values: unknown[]): FloydPendingPermission[] {
+  return values.map((value) => {
+    const data = pendingData(value);
+    return {
+      id: String(data.id ?? data.request_id ?? ''),
+      action: String(data.action ?? data.permission ?? data.kind ?? 'Requested operation'),
+      resources: stringList(data.resources ?? data.paths ?? data.patterns),
+    };
+  }).filter((request) => request.id);
+}
+
+export function formatFloydArtifact(value: unknown): string {
+  if (typeof value === 'string') return value || '(empty artifact)';
+  if (value === null || value === undefined) return '(empty artifact)';
+  return JSON.stringify(value, null, 2);
+}
+
+export function restoredIdeActivity(selectedView: string, selectedArtifactId: string | null): string | null {
+  if (selectedArtifactId) return 'ai';
+  if (!selectedView.startsWith('ide:')) return null;
+  const requested = selectedView.slice(4);
+  return requested === 'artifact' ? 'ai' : requested;
+}
+
+export function visibleModelRoute(route: ExperienceEnvelope['model_route']): { provider: string | null; model: string | null } {
+  return { provider: route.provider, model: route.model };
 }
 
 type ExperienceContinuityOptions = {
@@ -196,6 +264,30 @@ export class FloydExperienceClient {
       'GET',
       `/api/floyd/sessions/${encodeURIComponent(sessionId)}/transcript?run_id=${encodeURIComponent(runId)}`,
       undefined,
+      signal,
+    );
+  }
+
+  answerQuestion(sessionId: string, runId: string, requestId: string, answers: string[][], signal?: AbortSignal): Promise<unknown> {
+    return this.request(
+      'POST',
+      `/api/floyd/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(requestId)}/answer`,
+      { run_id: runId, answers },
+      signal,
+    );
+  }
+
+  decidePermission(
+    sessionId: string,
+    runId: string,
+    requestId: string,
+    reply: 'once' | 'always' | 'reject',
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.request(
+      'POST',
+      `/api/floyd/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}`,
+      { run_id: runId, reply },
       signal,
     );
   }
