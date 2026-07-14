@@ -30,6 +30,7 @@ import {
   resolveFloydProject,
   updateFloydExperience,
 } from './floyd-core';
+import { ideHealthPayload } from './src/lib/ide-health';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,11 +42,7 @@ async function startServer(): Promise<void> {
   app.use(express.json({ limit: '50mb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({
-      status: 'ok',
-      service: 'mobile-web-ide',
-      time: new Date().toISOString(),
-    });
+    res.json(ideHealthPayload());
   });
 
   app.get('/api/floyd/health', asyncHandler(async (req, res) => {
