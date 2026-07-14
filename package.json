@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
+    "test": "node --import tsx --test \"test/*.test.ts\"",
     "start": "tsx server.ts",
     "postinstall": "node -e \"try{require('fs').chmodSync('node_modules/node-pty/prebuilds/'+(process.platform==='darwin'?'darwin-'+process.arch:process.platform+'-'+process.arch)+'/spawn-helper',0o755)}catch{}\""
   },

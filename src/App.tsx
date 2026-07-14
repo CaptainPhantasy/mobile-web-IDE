@@ -45,6 +45,14 @@ import {
 } from './lib/fs';
 import { localRead, localWrite, localWorkspaceInfo, QUICK_LOCATIONS } from './lib/localfs';
 import { kvGet, kvSet, kvDel } from './lib/kv';
+import {
+  effectiveWorkspaceRoot,
+  FloydExperienceClient,
+  FloydSurfaceError,
+  type ExperienceEnvelope,
+  type ExperienceEnvelopePatch,
+  type FloydProjectSummary,
+} from './lib/floyd-experience';
 import { BUILTIN_THEMES, Theme, applyTheme } from './lib/themes';
 import * as ext from './lib/extensions';
 import { Breakpoint } from './lib/debugger';
@@ -67,6 +75,8 @@ type Activity =
   | 'projects'
   | 'collab'
   | 'ai';
+
+const ACTIVITIES = new Set<Activity>(['files', 'search', 'git', 'debug', 'drive', 'ext', 'projects', 'collab', 'ai']);
 
 type Tab = { path: string; dirty: boolean };
 
@@ -120,8 +130,22 @@ export default function App() {
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [customPath, setCustomPath] = useState('');
   const [homeDir, setHomeDir] = useState<string | null>(null);
+  const [bootComplete, setBootComplete] = useState(false);
+  const [experience, setExperience] = useState<ExperienceEnvelope | null>(null);
+  const [experienceReady, setExperienceReady] = useState(false);
+  const [composerDraft, setComposerDraft] = useState('');
 
   const bootedRef = useRef(false);
+  const experienceClient = useMemo(() => new FloydExperienceClient(), []);
+  const experienceRef = useRef<ExperienceEnvelope | null>(null);
+  const workspaceRef = useRef<Workspace | null>(null);
+  const tabsRef = useRef<Tab[]>([]);
+  const draftDirtyRef = useRef(false);
+  const composerDraftRef = useRef('');
+  const publishQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const restoredWorkspacePathRef = useRef<string | null>(null);
+  const lastPublishedActivityRef = useRef<Activity | null>(null);
+  const activityRef = useRef<Activity>('files');
   const author = useMemo(
     () => ({ name: 'Mobile IDE User', email: 'user@webide.local' }),
     [],
@@ -195,6 +219,7 @@ export default function App() {
 
       setThemes(ext.host.listThemes());
       bootedRef.current = true;
+      setBootComplete(true);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -215,6 +240,11 @@ export default function App() {
   useEffect(() => {
     (window as any).__WEBIDE_ACTIVE_PATH = active;
   }, [active]);
+
+  useEffect(() => { workspaceRef.current = workspace; }, [workspace]);
+  useEffect(() => { tabsRef.current = tabs; }, [tabs]);
+  useEffect(() => { activityRef.current = activity; }, [activity]);
+  useEffect(() => { composerDraftRef.current = composerDraft; }, [composerDraft]);
 
   // --- tabs / open ---
   const isLocalFile = useCallback(
@@ -294,6 +324,152 @@ export default function App() {
     setActive(undefined);
     kvDel('last.workspace');
   }, []);
+
+  const applyExperienceEnvelope = useCallback(async (
+    envelope: ExperienceEnvelope,
+    project?: FloydProjectSummary | null,
+  ): Promise<void> => {
+    const prior = experienceRef.current;
+    if (prior && envelope.revision <= prior.revision) return;
+    experienceRef.current = envelope;
+    setExperience(envelope);
+
+    if (!draftDirtyRef.current) setComposerDraft(envelope.composer_draft);
+
+    if (envelope.selected_view.startsWith('ide:')) {
+      const desired = envelope.selected_view.slice(4) as Activity;
+      if (ACTIVITIES.has(desired)) {
+        lastPublishedActivityRef.current = desired;
+        activityRef.current = desired;
+        setActivity(desired);
+      }
+    } else {
+      // Do not claim another surface's selected view merely because this IDE
+      // attached. Only a later user navigation publishes an IDE view.
+      lastPublishedActivityRef.current = activityRef.current;
+    }
+
+    const activeProject = project
+      ?? (envelope.active.project_id ? await experienceClient.project(envelope.active.project_id) : null);
+    if (experienceRef.current?.revision !== envelope.revision) return;
+    if (!activeProject?.root_path || workspaceRef.current?.path === activeProject.root_path) return;
+    if (tabsRef.current.some((tab) => tab.dirty)) {
+      setNotification(`Floyd continued in ${activeProject.root_path}, but this IDE kept the current workspace because it has unsaved files.`);
+      return;
+    }
+    try {
+      const info = await localWorkspaceInfo(activeProject.root_path);
+      if (experienceRef.current?.revision !== envelope.revision) return;
+      const nextWorkspace: Workspace = { type: 'local', path: activeProject.root_path, name: info.name };
+      restoredWorkspacePathRef.current = activeProject.root_path;
+      workspaceRef.current = nextWorkspace;
+      setWorkspace(nextWorkspace);
+      setLocalRoot(activeProject.root_path);
+      setTabs([]);
+      setActive(undefined);
+      setRecentWorkspaces((priorWorkspaces) => [
+        nextWorkspace,
+        ...priorWorkspaces.filter((candidate) => !(candidate.type === 'local' && candidate.path === nextWorkspace.path)),
+      ].slice(0, 20));
+    } catch (error) {
+      setNotification(`Floyd workspace is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [experienceClient]);
+
+  const enqueuePublish = useCallback((operation: () => Promise<void>): Promise<void> => {
+    const queued = publishQueueRef.current.then(operation, operation);
+    publishQueueRef.current = queued.catch(() => {});
+    return queued;
+  }, []);
+
+  const applyConflict = useCallback(async (error: unknown): Promise<boolean> => {
+    if (!(error instanceof FloydSurfaceError) || error.status !== 409) return false;
+    const payload = error.payload as { envelope?: ExperienceEnvelope } | null;
+    if (payload?.envelope) await applyExperienceEnvelope(payload.envelope);
+    setNotification('Floyd state changed on another surface. Its newer state was kept; repeat your action if it is still wanted.');
+    return true;
+  }, [applyExperienceEnvelope]);
+
+  const publishExperiencePatch = useCallback((
+    patch: Omit<ExperienceEnvelopePatch, 'expected_revision'>,
+  ): Promise<void> => enqueuePublish(async () => {
+    const current = experienceRef.current;
+    if (!current) return;
+    try {
+      const updated = await experienceClient.update({ ...patch, expected_revision: current.revision });
+      await applyExperienceEnvelope(updated);
+    } catch (error) {
+      if (await applyConflict(error)) return;
+      throw error;
+    }
+  }), [applyConflict, applyExperienceEnvelope, enqueuePublish, experienceClient]);
+
+  // Core wins initial cross-surface restoration. Later stream revisions are
+  // applied only when newer; dirty editor buffers are never replaced.
+  useEffect(() => {
+    if (!bootComplete) return;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const snapshot = await experienceClient.restore(controller.signal);
+        await applyExperienceEnvelope(snapshot.envelope, snapshot.project);
+        if (controller.signal.aborted) return;
+        setExperienceReady(true);
+        for await (const event of experienceClient.watch(String(snapshot.envelope.revision), controller.signal)) {
+          if (event.type !== 'experience' || !event.data || typeof event.data !== 'object') continue;
+          await applyExperienceEnvelope(event.data as ExperienceEnvelope);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setNotification(`Floyd experience is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    })();
+    return () => controller.abort();
+  }, [applyExperienceEnvelope, bootComplete, experienceClient]);
+
+  // A user-opened host folder becomes Core's active project. A workspace
+  // restored from Core is tagged above so this effect does not clear its
+  // active session/run by publishing it back as a new selection.
+  useEffect(() => {
+    if (!experienceReady || workspace?.type !== 'local') return;
+    if (restoredWorkspacePathRef.current === workspace.path) {
+      restoredWorkspacePathRef.current = null;
+      return;
+    }
+    void enqueuePublish(async () => {
+      const current = experienceRef.current;
+      if (!current) return;
+      try {
+        const updated = await experienceClient.publishWorkspace(workspace.path, current.revision);
+        await applyExperienceEnvelope(updated);
+      } catch (error) {
+        if (await applyConflict(error)) return;
+        setNotification(`Could not publish workspace to Floyd: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+  }, [applyConflict, applyExperienceEnvelope, enqueuePublish, experienceClient, experienceReady, workspace]);
+
+  useEffect(() => {
+    if (!experienceReady || lastPublishedActivityRef.current === activity) return;
+    lastPublishedActivityRef.current = activity;
+    void publishExperiencePatch({ selected_view: `ide:${activity}` }).catch((error) => {
+      setNotification(`Could not publish IDE view: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, [activity, experienceReady, publishExperiencePatch]);
+
+  useEffect(() => {
+    if (!experienceReady || !draftDirtyRef.current) return;
+    const draft = composerDraft;
+    const timer = window.setTimeout(() => {
+      void publishExperiencePatch({ composer_draft: draft }).then(() => {
+        if (composerDraftRef.current === draft) draftDirtyRef.current = false;
+      }).catch((error) => {
+        setNotification(`Could not publish Floyd draft: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [composerDraft, experienceReady, publishExperiencePatch]);
 
   async function handleOpenFolder(rawPath: string) {
     const p = resolvePath(rawPath);
@@ -508,6 +684,24 @@ export default function App() {
 
   const activeDoc = active ? docs[active] ?? '' : '';
 
+  const handleComposerDraftChange = useCallback((draft: string) => {
+    draftDirtyRef.current = true;
+    composerDraftRef.current = draft;
+    setComposerDraft(draft);
+  }, []);
+
+  const handleAiContextChange = useCallback((context: { sessionId: string | null; runId: string | null }) => {
+    // New-run context is committed by the server before it emits the session
+    // frame. Only the explicit New Conversation action needs a browser patch.
+    if (context.sessionId !== null || context.runId !== null) return;
+    void publishExperiencePatch({
+      active: { session_id: null, run_id: null },
+      selected_view: 'ide:ai',
+    }).catch((error) => {
+      setNotification(`Could not clear Floyd session: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, [publishExperiencePatch]);
+
   // Dev-only error-boundary test hook. Call `window.__crashPanel('side')`
   // or `__crashPanel('editor')` or `__crashPanel('bottom')` in DevTools to
   // force a render-time throw in the named scope so you can confirm the
@@ -554,7 +748,8 @@ export default function App() {
     { id: 'ai',       glyph: 'ai',       label: 'AI', title: 'AI Assistant' },
   ];
 
-  const projectRel = projectDir.replace(ROOT + '/', '');
+  const activeWorkspaceRoot = effectiveWorkspaceRoot(projectDir, localRoot);
+  const projectRel = activeWorkspaceRoot.replace(ROOT + '/', '');
   const crumbs = projectRel.split('/').filter(Boolean);
   const crumbClass = (i: number) => ['crumb-a', 'crumb-b', 'crumb-c'][i % 3];
   const workspaceLabel = workspace
@@ -665,15 +860,19 @@ export default function App() {
               />
             )}
             {activity === 'search' && (
-              <SearchPanel projectDir={projectDir} onOpen={(p, l) => openPath(p, l)} />
+              localRoot
+                ? <div className="panel"><div className="panel-error">Local-folder search is not available yet. Use the terminal so this IDE never searches the wrong virtual project.</div></div>
+                : <SearchPanel projectDir={projectDir} onOpen={(p, l) => openPath(p, l)} />
             )}
             {activity === 'git' && (
-              <GitPanel
-                projectDir={projectDir}
-                onProjectChanged={setProjectDir}
-                onRefresh={() => setTree((k) => k + 1)}
-                author={author}
-              />
+              localRoot
+                ? <div className="panel"><div className="panel-error">Local-folder Git uses the terminal. Browser Git is limited to IndexedDB projects.</div></div>
+                : <GitPanel
+                    projectDir={projectDir}
+                    onProjectChanged={setProjectDir}
+                    onRefresh={() => setTree((k) => k + 1)}
+                    author={author}
+                  />
             )}
             {activity === 'debug' && (
               <DebugPanel
@@ -712,8 +911,13 @@ export default function App() {
             )}
             {activity === 'ai' && (
               <AIChatPanel
-                projectDir={projectDir}
+                projectDir={activeWorkspaceRoot}
                 openFiles={tabs.map((t) => t.path)}
+                draft={composerDraft}
+                restoredSessionId={experience?.active.session_id || undefined}
+                restoredRunId={experience?.active.run_id || undefined}
+                onDraftChange={handleComposerDraftChange}
+                onContextChange={handleAiContextChange}
                 onFileChanged={() => setTree((k) => k + 1)}
               />
             )}
@@ -808,7 +1012,7 @@ export default function App() {
             <span className="st-branch" title="Brand"><Glyph name="bolt" /> MWIDE</span>
             <span className="st-path" title={active || 'no file'}>
               <span className="st-key">FILE</span>
-              {active ? active.replace(projectDir + '/', '').replace(ROOT + '/', '~/') : '—'}
+              {active ? active.replace(activeWorkspaceRoot + '/', '').replace(ROOT + '/', '~/') : '—'}
             </span>
             <span className="spacer" />
             <span className="st-pos"><span className="st-key">POS</span>{String(cursor.line).padStart(3, ' ')}:{String(cursor.col).padStart(3, ' ')}</span>
@@ -848,7 +1052,7 @@ export default function App() {
             <ErrorBoundary label={'Bottom: ' + bottomTab} resetKey={bottomTab}>
               <Crasher scope="bottom" />
               {bottomTab === 'terminal' && (
-                <Terminal projectDir={projectDir} author={author} />
+                <Terminal projectDir={activeWorkspaceRoot} author={author} />
               )}
               {bottomTab === 'debug' && (
                 <DebugPanel

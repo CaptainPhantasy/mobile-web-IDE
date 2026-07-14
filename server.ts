@@ -17,7 +17,17 @@ import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import fs from 'fs/promises';
 import { setupPtyHub } from './pty-hub';
-import { FloydApiError, floyd, resolveFloydProject } from './floyd-core';
+import {
+  FloydApiError,
+  floyd,
+  getFloydExperience,
+  getFloydProject,
+  negotiateFloydExperience,
+  publishFloydRunContext,
+  publishFloydWorkspace,
+  resolveFloydProject,
+  updateFloydExperience,
+} from './floyd-core';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,6 +55,17 @@ async function startServer(): Promise<void> {
       throw error;
     }
   }));
+
+  // Browser-safe Floyd Experience adapter. The Core gateway token never
+  // crosses this same-origin boundary; all Core calls happen in this process.
+  app.post('/api/floyd/experience/negotiate', asyncHandler(floydExperienceNegotiate));
+  app.get('/api/floyd/experience', asyncHandler(floydExperienceGet));
+  app.patch('/api/floyd/experience', asyncHandler(floydExperiencePatch));
+  app.get('/api/floyd/experience/stream', asyncHandler(floydExperienceStream));
+  app.post('/api/floyd/workspace', asyncHandler(floydWorkspacePublish));
+  app.get('/api/floyd/sessions/:sessionId/transcript', asyncHandler(floydTranscriptGet));
+  app.get('/api/floyd/projects/:projectId', asyncHandler(floydProjectGet));
+  app.get('/api/floyd/artifacts/:artifactId', asyncHandler(floydArtifactGet));
 
   app.post('/api/floyd/stream', asyncHandler(floydStream));
 
@@ -296,8 +317,172 @@ function asyncHandler(fn: RequestHandler): RequestHandler {
   };
 }
 
+function requestAbort(req: Request, res: Response): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  req.once('aborted', abort);
+  res.once('close', abort);
+  return {
+    signal: controller.signal,
+    dispose: () => { req.off('aborted', abort); res.off('close', abort); },
+  };
+}
+
+function sendFloydFailure(res: Response, error: unknown): void {
+  if (error instanceof FloydApiError) {
+    if (typeof error.payload === 'string') res.status(error.status).send(error.payload);
+    else res.status(error.status).json(error.payload);
+    return;
+  }
+  throw error;
+}
+
+async function floydExperienceNegotiate(req: Request, res: Response): Promise<void> {
+  const abort = requestAbort(req, res);
+  try { res.json(await negotiateFloydExperience(abort.signal)); }
+  catch (error) { sendFloydFailure(res, error); }
+  finally { abort.dispose(); }
+}
+
+async function floydExperienceGet(req: Request, res: Response): Promise<void> {
+  const abort = requestAbort(req, res);
+  try { res.json(await getFloydExperience(abort.signal)); }
+  catch (error) { sendFloydFailure(res, error); }
+  finally { abort.dispose(); }
+}
+
+async function floydExperiencePatch(req: Request, res: Response): Promise<void> {
+  const abort = requestAbort(req, res);
+  try { res.json(await updateFloydExperience(req.body, abort.signal)); }
+  catch (error) { sendFloydFailure(res, error); }
+  finally { abort.dispose(); }
+}
+
+async function floydWorkspacePublish(req: Request, res: Response): Promise<void> {
+  const rootPath = typeof req.body?.root_path === 'string' ? req.body.root_path.trim() : '';
+  const expectedRevision = req.body?.expected_revision;
+  if (!rootPath || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    res.status(400).json({ error: 'root_path and non-negative expected_revision are required' });
+    return;
+  }
+  const abort = requestAbort(req, res);
+  try {
+    const realRoot = await fs.realpath(rootPath);
+    assertAllowed(realRoot);
+    const stat = await fs.stat(realRoot);
+    if (!stat.isDirectory()) { res.status(400).json({ error: 'root_path must be a directory' }); return; }
+    res.json(await publishFloydWorkspace(realRoot, expectedRevision, abort.signal));
+  }
+  catch (error) { sendFloydFailure(res, error); }
+  finally { abort.dispose(); }
+}
+
+async function floydProjectGet(req: Request, res: Response): Promise<void> {
+  const abort = requestAbort(req, res);
+  try {
+    const project = await getFloydProject(req.params.projectId, abort.signal);
+    if (!project) { res.status(404).json({ error: 'Floyd project not found' }); return; }
+    res.json(project);
+  } catch (error) { sendFloydFailure(res, error); }
+  finally { abort.dispose(); }
+}
+
+async function floydArtifactGet(req: Request, res: Response): Promise<void> {
+  const abort = requestAbort(req, res);
+  try { res.json(await floyd.artifactById(req.params.artifactId, abort.signal)); }
+  catch (error) { sendFloydFailure(res, error); }
+  finally { abort.dispose(); }
+}
+
+async function floydTranscriptGet(req: Request, res: Response): Promise<void> {
+  const runId = typeof req.query.run_id === 'string' ? req.query.run_id : '';
+  if (!runId) { res.status(400).json({ error: 'run_id is required' }); return; }
+  const request = requestAbort(req, res);
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), 15_000);
+  const signal = AbortSignal.any([request.signal, timeout.signal]);
+  const iterator = floyd.attachSession(req.params.sessionId, 'mobile-web-ide-transcript', { runId, signal });
+  try {
+    for await (const event of iterator) {
+      if (event.type === 'error') {
+        res.status(502).json({ error: 'transcript_attach_failed', detail: event.data });
+        return;
+      }
+      if (event.type !== 'transcript') continue;
+      const payload = event.data && typeof event.data === 'object'
+        ? event.data as Record<string, unknown>
+        : {};
+      if (payload.unavailable) {
+        res.status(502).json({ error: 'transcript_unavailable', detail: payload.unavailable });
+        return;
+      }
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        session_id: req.params.sessionId,
+        run_id: runId,
+        engine_session_id: payload.engine_session_id ?? null,
+        messages: Array.isArray(payload.messages) ? payload.messages : [],
+      });
+      return;
+    }
+    if (!request.signal.aborted) {
+      res.status(timeout.signal.aborted ? 504 : 502).json({
+        error: timeout.signal.aborted ? 'transcript_timeout' : 'transcript_missing',
+      });
+    }
+  } catch (error) {
+    if (request.signal.aborted) return;
+    if (timeout.signal.aborted) { res.status(504).json({ error: 'transcript_timeout' }); return; }
+    sendFloydFailure(res, error);
+  } finally {
+    clearTimeout(timer);
+    await iterator.return(undefined).catch(() => {});
+    request.dispose();
+  }
+}
+
+function writeFloydSse(res: Response, event: { id?: string; type: string; data: unknown }): void {
+  if (event.id) res.write(`id: ${event.id}\n`);
+  res.write(`event: ${event.type}\n`);
+  res.write(`data: ${JSON.stringify(event.data)}\n\n`);
+}
+
+async function floydExperienceStream(req: Request, res: Response): Promise<void> {
+  const abort = requestAbort(req, res);
+  const rawLastId = req.headers['last-event-id'] ?? req.query.lastEventId;
+  const lastCandidate = Array.isArray(rawLastId) ? rawLastId[0] : rawLastId;
+  const lastEventId = typeof lastCandidate === 'string' ? lastCandidate : undefined;
+  const iterator = floyd.watchExperience('primary', { lastEventId, signal: abort.signal });
+  try {
+    // Pull once before committing HTTP 200 so upstream authentication/status
+    // errors retain their exact status and body.
+    let next = await iterator.next();
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    while (!next.done && !abort.signal.aborted) {
+      writeFloydSse(res, next.value);
+      next = await iterator.next();
+    }
+    if (!abort.signal.aborted) res.end();
+  } catch (error) {
+    if (abort.signal.aborted) return;
+    if (!res.headersSent) { sendFloydFailure(res, error); return; }
+    const payload = error instanceof FloydApiError
+      ? { status: error.status, error: error.payload }
+      : { status: 500, error: error instanceof Error ? error.message : String(error) };
+    writeFloydSse(res, { type: 'error', data: payload });
+    res.end();
+  } finally {
+    await iterator.return(undefined).catch(() => {});
+    abort.dispose();
+  }
+}
+
 async function floydStream(req: Request, res: Response): Promise<void> {
-  const { projectDir, message, sessionId } = req.body as { projectDir?: string; message?: string; sessionId?: string };
+  const { projectDir, message, sessionId, runId: requestedRunId } = req.body as { projectDir?: string; message?: string; sessionId?: string; runId?: string };
   if (!projectDir || !message?.trim()) { res.status(400).json({ error: 'projectDir and message are required' }); return; }
   const abort = new AbortController();
   const cancel = () => abort.abort();
@@ -305,22 +490,23 @@ async function floydStream(req: Request, res: Response): Promise<void> {
   res.once('close', cancel);
   try {
     let activeSession = sessionId;
-    let runId: string | undefined;
+    let runId: string | undefined = requestedRunId;
     if (activeSession) {
-      await floyd.steer(activeSession, message.trim(), 'mobile-web-ide', abort.signal);
+      await floyd.steer(activeSession, message.trim(), 'mobile-web-ide', abort.signal, runId);
     } else {
       const projectId = await resolveFloydProject(projectDir, abort.signal);
       const created = await floyd.submit(projectId, message.trim(), abort.signal);
       runId = created.run_id;
       const run = await floyd.run(runId, abort.signal);
       activeSession = String(run.session_id);
+      await publishFloydRunContext(projectId, activeSession, runId, abort.signal);
     }
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
     res.write(`data: ${JSON.stringify({ type: 'session', sessionId: activeSession, runId })}\n\n`);
-    for await (const event of floyd.attachSession(activeSession, 'mobile-web-ide', { signal: abort.signal })) {
+    for await (const event of floyd.attachSession(activeSession, 'mobile-web-ide', { signal: abort.signal, runId })) {
       if (abort.signal.aborted) break;
       const envelope = (event.data || {}) as Record<string, unknown>;
       const data = (envelope.data || {}) as Record<string, unknown>;
